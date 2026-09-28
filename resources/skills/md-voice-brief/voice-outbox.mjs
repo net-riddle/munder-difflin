@@ -240,6 +240,150 @@ export function normalizeSpoken(text) {
   return String(text ?? '').replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * Target length of ONE piece, in characters. `MAX_SPOKEN_CHARS` (600) is the hard
+ * cap on a whole message and stays where it is; this is a different thing, the
+ * length at which a single clip becomes a long unbroken stretch of speech.
+ *
+ * The number is a TARGET, not a limit: a piece is never split mid-word, and a
+ * single sentence longer than this is still broken up (see `splitForSpeech`).
+ */
+export const MAX_PIECE_CHARS = 220;
+
+/** Sentence ends: `.`/`!`/`?`/`…` (and CJK equivalents) followed by a space. */
+const SENTENCE_END = /([.!?…。！？]+)\s+/g;
+
+/** Weaker boundaries, used only when one sentence is longer than a whole piece. */
+const CLAUSE_END = /([,;:—–)\]]+)\s+/g;
+
+/**
+ * Cut one oversized unit into pieces of at most `maxChars`, never inside a word.
+ *
+ * The invariant the caller can rely on: `pieces.join(' ') === unit` for every
+ * unit this function is given, and no piece ends mid-word unless the word itself
+ * is longer than `maxChars` (in which case there is nowhere else to cut, and a
+ * test says so out loud instead of pretending otherwise).
+ */
+function chopLongUnit(unit, maxChars) {
+  if (unit.length <= maxChars) return [unit];
+  const out = [];
+  let rest = unit;
+  while (rest.length > maxChars) {
+    // Prefer a clause boundary inside the window, then a space. Both are searched
+    // only within `maxChars` so the cut can never land past the target.
+    const window = rest.slice(0, maxChars + 1);
+    let cut = -1;
+    CLAUSE_END.lastIndex = 0;
+    for (let m = CLAUSE_END.exec(window); m; m = CLAUSE_END.exec(window)) cut = m.index + m[0].length;
+    if (cut <= 0) {
+      const sp = window.lastIndexOf(' ');
+      if (sp > 0) cut = sp + 1;
+    }
+    if (cut <= 0) {
+      // One word longer than the target: there is no boundary to cut on, so the
+      // remainder is emitted whole rather than mangled.
+      out.push(rest);
+      return out;
+    }
+    out.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut);
+  }
+  if (rest.trim()) out.push(rest.trim());
+  return out;
+}
+
+/**
+ * Split a spoken message into pieces that are each a comfortable stretch of
+ * speech, in order, so they can be synthesized and played one after another.
+ *
+ * The human asked for this: a long message was one clip, and a long clip is
+ * all-or-nothing — if it fails the user hears nothing at all, and there is no
+ * natural pause to interrupt at.
+ *
+ * Boundaries, strongest first: sentence end, then clause punctuation, then a
+ * word boundary. Never inside a word. A text that is already short enough comes
+ * back as a single piece, so the single-message path is untouched.
+ */
+export function splitForSpeech(text, maxChars = MAX_PIECE_CHARS) {
+  const norm = normalizeSpoken(text);
+  if (!norm) return [];
+  const limit = Math.max(1, Number(maxChars) || MAX_PIECE_CHARS);
+
+  const sentences = [];
+  let last = 0;
+  SENTENCE_END.lastIndex = 0;
+  for (let m = SENTENCE_END.exec(norm); m; m = SENTENCE_END.exec(norm)) {
+    sentences.push(norm.slice(last, m.index + m[1].length));
+    last = m.index + m[0].length;
+  }
+  if (last < norm.length) sentences.push(norm.slice(last));
+  if (sentences.length === 0) sentences.push(norm);
+
+  const units = [];
+  for (const s of sentences) {
+    const t = s.trim();
+    if (t) units.push(...chopLongUnit(t, limit));
+  }
+  if (units.length === 0) return [];
+  if (units.length === 1) return units;
+
+  // Pack whole sentences into pieces without exceeding the target.
+  const pieces = [];
+  let cur = '';
+  for (const u of units) {
+    if (cur && cur.length + 1 + u.length > limit) { pieces.push(cur); cur = u; }
+    else cur = cur ? `${cur} ${u}` : u;
+  }
+  if (cur) pieces.push(cur);
+  return pieces;
+}
+
+/**
+ * The aggregate verdict for a run of pieces: the WORST of them, never the last.
+ *
+ * The same rule as a spoken line's outcome (played / cut-short / failed): a
+ * message that said its first half and then failed has NOT been delivered, and
+ * counting the last piece's success would say it was.
+ */
+export function aggregateOutcome(results) {
+  if (!Array.isArray(results) || results.length === 0) return 'failed';
+  if (results.some((r) => !r.ok && !r.queued)) return 'failed';
+  if (results.some((r) => r.queued)) return 'queued';
+  return 'played';
+}
+
+/**
+ * Synthesize and play `pieces` in order, one after another, through injected
+ * `synth(piece, index)` and `play(synthResult, index)`.
+ *
+ * A piece that FAILS does not stop the chain: the point of splitting is that a
+ * human gets as much of the answer as possible, and stopping at the first
+ * failure would rebuild the all-or-nothing clip this exists to break. A piece
+ * that is `queued` (no playback implementation on this platform) DOES stop it,
+ * because there is nothing to play and continuing would only burn the same
+ * failure N more times.
+ */
+export async function speakPieces(pieces, { synth, play, onPiece } = {}) {
+  const results = [];
+  for (let i = 0; i < pieces.length; i++) {
+    const syn = await synth(pieces[i], i);
+    if (!syn || !syn.ok) {
+      results.push({ piece: i + 1, of: pieces.length, ok: false, stage: 'synthesize', error: (syn && syn.error) || 'synthesis failed' });
+      if (onPiece) onPiece(results[results.length - 1]);
+      continue;
+    }
+    const played = (await play(syn, i)) || {};
+    results.push({
+      piece: i + 1, of: pieces.length, ok: !!played.ok,
+      stage: played.ok ? 'played' : 'playback', error: played.error, queued: !!played.queued,
+    });
+    if (onPiece) onPiece(results[results.length - 1]);
+    if (played.queued) break;
+  }
+  return { outcome: aggregateOutcome(results), results };
+}
+
+
 // ─── playback ────────────────────────────────────────────────────────────────
 
 /**
@@ -531,37 +675,53 @@ export async function flushOne(outbox, name, { userData, fetchImpl, platform } =
 
   const settings = resolveTtsSettings(readConfig(userData), { voice: env.voice });
   const spoken = normalizeSpoken(env.text);
-  const syn = await synthesize(spoken, settings, fetchImpl);
-  if (!syn.ok) {
+  // One envelope, N pieces. The envelope is what the human is owed; the pieces
+  // are only how the audio is delivered, so they never become N files.
+  const pieces = splitForSpeech(spoken);
+  if (pieces.length === 0) {
     const to = join(outbox, '.failed');
     mkdirSync(to, { recursive: true });
     renameSync(src, join(to, name));
-    return { ok: false, name, error: syn.error };
+    return { ok: false, name, error: 'nothing speakable to say' };
   }
 
-  const wav = join(tmpdir(), `md-voice-${randomUUID().slice(0, 8)}.wav`);
-  try {
-    writeFileSync(wav, syn.audio);
-    const played = playWavSync(wav, platform);
-    if (!played.ok) {
-      // A platform with no playback implementation leaves the envelope where it
-      // is: it was not spoken, but nothing failed either, and the next drainer
-      // (or the next run on Windows) must still find it. Everything else — a
-      // missing clip, a refused PlaySound, an unplayable file — is a real
-      // failure of THIS message and goes to `.failed/`, which is a move, never a
-      // delete.
-      if (played.queued) return { ok: false, name, queued: true, error: played.error };
-      const to = join(outbox, '.failed');
-      mkdirSync(to, { recursive: true });
-      renameSync(src, join(to, name));
-      return { ok: false, name, error: played.error };
-    }
-    const to = join(outbox, '.done');
+  const temps = [];
+  const file = (sub) => {
+    const to = join(outbox, sub);
     mkdirSync(to, { recursive: true });
     renameSync(src, join(to, name));
-    return { ok: true, name, chars: spoken.length };
+  };
+
+  try {
+    const { outcome, results } = await speakPieces(pieces, {
+      synth: async (piece) => synthesize(piece, settings, fetchImpl),
+      play: async (syn) => {
+        const wav = join(tmpdir(), `md-voice-${randomUUID().slice(0, 8)}.wav`);
+        temps.push(wav);
+        writeFileSync(wav, syn.audio);
+        return playWavSync(wav, platform);
+      },
+    });
+
+    const summary = {
+      name, chars: spoken.length, pieces: pieces.length,
+      spoken: results.filter((r) => r.ok).length, outcome, results,
+    };
+
+    if (outcome === 'queued') {
+      // A platform with no playback implementation leaves the envelope where it
+      // is: it was not spoken, but nothing failed either, and the next drainer
+      // (or the next run on Windows) must still find it.
+      return { ...summary, ok: false, queued: true, error: results.find((r) => r.queued)?.error };
+    }
+    if (outcome === 'failed') {
+      file('.failed');
+      return { ...summary, ok: false, error: results.filter((r) => !r.ok).map((r) => `piece ${r.piece}/${r.of}: ${r.error}`).join('; ') };
+    }
+    file('.done');
+    return { ...summary, ok: true };
   } finally {
-    try { unlinkSync(wav); } catch { /* best effort */ }
+    for (const wav of temps) { try { unlinkSync(wav); } catch { /* best effort */ } }
   }
 }
 

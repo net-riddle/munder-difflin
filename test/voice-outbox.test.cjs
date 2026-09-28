@@ -425,3 +425,161 @@ test('a genuine failure still MOVES the envelope to .failed (a move, not a delet
   assert.ok(existsSync(join(dir, '.failed', name)), 'the message must be preserved for the human');
   assert.ok(!existsSync(join(dir, name)));
 });
+
+// ─── 064: a long message is cut into pieces and spoken in sequence ───────────
+//
+// A long message used to be ONE clip, and a long clip is all-or-nothing: if it
+// failed the user heard nothing, and there was no natural place to interrupt.
+// These tests pin the two decisions that are easy to get wrong — where a piece
+// may end, and what a run of pieces adds up to.
+//
+// NOT exercised here: a real speaker. `speakPieces` takes `synth` and `play` as
+// injections precisely so the sequencing and the verdict can be tested without a
+// test that makes noise. The same boundary the header already draws for the
+// playback path.
+
+test('a message that already fits comes back as ONE piece', () => {
+  const p = mod.splitForSpeech('Ciao, questo e un test breve.');
+  assert.equal(p.length, 1);
+  assert.equal(p[0], 'Ciao, questo e un test breve.');
+});
+
+test('a long message is cut on sentence boundaries, never inside a word', () => {
+  // Two sentences long enough that packing them together would pass the target,
+  // so the first cut is forced to land on the sentence boundary.
+  const s1 = 'La prima frase di questa verifica e volutamente lunga, e deve occupare un pezzo intero senza che il taglio cada dentro una parola.';
+  const s2 = 'La seconda frase e lunga uguale, e finisce con un punto, cosi il confine e veramente un confine di frase e non uno spazio qualsiasi.';
+  const s3 = 'La terza chiude in breve.';
+  const text = mod.normalizeSpoken(s1 + ' ' + s2 + ' ' + s3);
+  assert.ok(text.length > mod.MAX_PIECE_CHARS, 'the fixture must exceed the target, or the split is not exercised');
+  const p = mod.splitForSpeech(text);
+  assert.ok(p.length > 1, 'expected more than one piece');
+  for (const piece of p) {
+    assert.ok(piece.length <= mod.MAX_PIECE_CHARS, `piece over target: ${piece.length}`);
+    // a piece may only end at sentence punctuation, never mid-word
+    assert.match(piece, /[.!…。！？]$/, `piece does not end on a boundary: ${JSON.stringify(piece.slice(-30))}`);
+  }
+  assert.equal(p[0], s1, 'the first cut is exactly the first sentence');
+  assert.equal(p.join(' '), text, 'and the pieces still rebuild the whole message');
+});
+
+test('the pieces recompose into the original text', () => {
+  // The invariant that makes the split safe: nothing is lost, nothing is
+  // invented. A splitter that dropped a connector would sound fine and mean
+  // something else, and no per-piece assertion would notice.
+  const texts = [
+    'Uno. Due. Tre.',
+    'Una frase lunghissima senza alcuna punteggiatura la cui fine coincide con il confine del pezzo esatto',
+    'A. B. C. D. E. F. G. H.',
+    'Mixed   whitespace\n\nand a tab\there. Then a second sentence.',
+  ];
+  for (const t of texts) {
+    const norm = mod.normalizeSpoken(t);
+    const p = mod.splitForSpeech(t);
+    assert.equal(p.join(' '), norm, `recomposition failed for ${JSON.stringify(t.slice(0, 40))}`);
+  }
+});
+
+test('one sentence longer than the target is cut at a word boundary', () => {
+  const words = [];
+  for (let i = 0; i < 90; i++) words.push(`parola${i}`);
+  const p = mod.splitForSpeech(words.join(' '));
+  assert.ok(p.length > 1, 'expected the oversized sentence to be cut');
+  for (const piece of p) {
+    assert.ok(piece.length <= mod.MAX_PIECE_CHARS, `piece over target: ${piece.length}`);
+    assert.doesNotMatch(piece, /\s$/, 'no piece keeps a trailing space');
+    assert.doesNotMatch(piece, /[a-zà-ÿ]\s*[.,;:]$/, 'no cut left a word hanging on punctuation');
+  }
+  assert.equal(p.join(' '), words.join(' '), 'no word may be split or lost');
+});
+
+test('a single word longer than the target is emitted whole, not mangled', () => {
+  // There is nowhere to cut inside a word. Emitting it whole is the honest
+  // choice; cutting it would change what is said.
+  const giant = 'x'.repeat(mod.MAX_PIECE_CHARS + 40);
+  const p = mod.splitForSpeech(giant);
+  assert.equal(p.join(' '), giant, 'the word must survive intact');
+});
+
+test('the run verdict is the WORST piece, never the last one', () => {
+  const cases = [
+    [[{ ok: true }, { ok: false, error: 'x' }, { ok: true }], 'failed', 'a middle failure is a failure'],
+    [[{ ok: true }, { ok: true }, { ok: false, error: 'x' }], 'failed', 'a last failure is a failure'],
+    [[{ ok: true }, { ok: true }, { ok: true }], 'played', 'all played is played'],
+    [[{ ok: false, queued: true, error: 'q' }], 'queued', 'queued is not a failure'],
+    [[], 'failed', 'nothing spoken is not a delivery'],
+  ];
+  for (const [results, want, why] of cases) {
+    assert.equal(mod.aggregateOutcome(results), want, why);
+  }
+});
+
+test('pieces are spoken in order, one after another', async () => {
+  const seen = [];
+  const r = await mod.speakPieces(['uno', 'due', 'tre'], {
+    synth: async (p) => { seen.push(`synth:${p}`); return { ok: true, audio: Buffer.alloc(4) }; },
+    play: async (syn, i) => { seen.push(`play:${i}`); return { ok: true }; },
+  });
+  assert.equal(r.outcome, 'played');
+  assert.deepEqual(seen, ['synth:uno', 'play:0', 'synth:due', 'play:1', 'synth:tre', 'play:2'],
+    'each piece must be synthesized and played before the next one starts');
+});
+
+test('a failed piece does NOT stop the chain: the human still gets the rest', async () => {
+  // Stopping at the first failure would rebuild the all-or-nothing clip this
+  // card exists to break.
+  const played = [];
+  const r = await mod.speakPieces(['uno', 'due', 'tre'], {
+    synth: async (p) => (p === 'due' ? { ok: false, error: 'sintesi fallita' } : { ok: true, audio: Buffer.alloc(4) }),
+    play: async (syn, i) => { played.push(i); return { ok: true }; },
+  });
+  assert.equal(r.outcome, 'failed', 'the run is a failure, and says so');
+  assert.deepEqual(played, [0, 2], 'the third piece must still be attempted');
+  assert.equal(r.results.filter((x) => x.ok).length, 2, 'two pieces were heard');
+  assert.equal(r.results[1].stage, 'synthesize', 'and the failing stage is named');
+});
+
+test('a queued piece stops the chain, because there is nothing to play', async () => {
+  let synths = 0;
+  const r = await mod.speakPieces(['uno', 'due', 'tre'], {
+    synth: async () => { synths++; return { ok: true, audio: Buffer.alloc(4) }; },
+    play: async () => ({ ok: false, queued: true, error: 'playback is only implemented for Windows' }),
+  });
+  assert.equal(r.outcome, 'queued');
+  assert.equal(synths, 1, 'the other pieces must not be synthesized for a speaker that does not exist');
+});
+
+test('flushOne on a long message: N pieces, but still ONE envelope in .done', async () => {
+  const { mkdtempSync, writeFileSync, readdirSync, existsSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'vo-064-'));
+  const name = 'msg-long.json';
+  const parts = [];
+  for (let i = 0; i < 8; i++) parts.push(`Questa e' la frase numero ${i} del messaggio lungo, e occupa un pezzo.`);
+  writeFileSync(join(dir, name), JSON.stringify({ v: 1, id: 'msg-long', text: parts.join(' '), createdAt: 'now' }), 'utf8');
+
+  let synths = 0;
+  const counting = async () => { synths++; return servesWav(realWav())(); };
+
+  // darwin: no playback implementation, so the chain stops at the first piece and
+  // the envelope must stay exactly where it is. That is the same contract the
+  // single-message path has, and it is the one place a real speaker is not needed.
+  const r = await mod.flushOne(dir, name, { userData: dir, fetchImpl: counting, platform: 'darwin' });
+  assert.equal(r.ok, false);
+  assert.equal(r.queued, true);
+  assert.equal(r.outcome, 'queued');
+  assert.ok(r.pieces > 1, `the message should have been split, got ${r.pieces} piece(s)`);
+  assert.equal(synths, 1, 'a queued chain stops instead of synthesizing every piece');
+  assert.deepEqual(readdirSync(dir), [name], 'the envelope must still be the only thing in the outbox');
+  assert.ok(!existsSync(join(dir, '.done')), 'nothing was spoken, so nothing may be marked done');
+});
+
+test('the verifier: the long text really is over the target', () => {
+  // Guards the test above: if MAX_PIECE_CHARS were raised past this text, the
+  // "should have been split" assertion would pass for the wrong reason.
+  const parts = [];
+  for (let i = 0; i < 8; i++) parts.push(`Questa e' la frase numero ${i} del messaggio lungo, e occupa un pezzo.`);
+  assert.ok(mod.normalizeSpoken(parts.join(' ')).length > mod.MAX_PIECE_CHARS * 2,
+    'the fixture must exceed two targets, or the split is not being exercised');
+});
