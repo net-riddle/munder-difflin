@@ -213,7 +213,14 @@ export class MemoryReflector {
     try {
       summary = await this.summarize(home, parsed.condensed, evict, parsed.pinned);
     } catch (e) {
-      this.logAbort(id, 'summarize-failed', String(e));
+      // `cwd` is the field that makes this reproducible: it is what projectDir()
+      // turns into ~/.claude/projects/<key>, so the dir that was searched can be
+      // recomputed from the log line alone. The session id is not in scope here
+      // — the agent id is what condense() is given — but when a transcript did
+      // exist, the detail embedded in `e` names it (the file's basename IS the
+      // Claude session id). Before this, the line carried neither, which is why
+      // 35 aborts could not be told apart.
+      this.logAbort(id, 'summarize-failed', String(e), { cwd: home });
       return { id, condensed: false, reason: 'summarize-failed', oldBytes };
     }
 
@@ -287,7 +294,14 @@ export class MemoryReflector {
     });
 
     if (!result.ok || !result.text) {
-      throw new Error(result.error ?? 'condense: hidden session returned no text');
+      // The reason is already inside `error`, but keep it structured on the
+      // thrown error too so a caller can branch on the case rather than parse
+      // the sentence back out of it.
+      const err = new Error(result.error ?? 'condense: hidden session returned no text');
+      if (result.reason) {
+        (err as Error & { hiddenClaudeReason?: string }).hiddenClaudeReason = result.reason;
+      }
+      throw err;
     }
     const parsed = parseSummary(result.text);
     if (!parsed) throw new Error('condense: response contained no parseable JSON');

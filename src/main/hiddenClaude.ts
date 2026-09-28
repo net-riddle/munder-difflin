@@ -47,23 +47,57 @@ export interface HiddenClaudeOptions {
   env?: Record<string, string>;
 }
 
+/** Why a hidden session produced no usable answer.
+ *
+ *  These used to be four separate `return null`s inside
+ *  extractLastAssistantText, all of which surfaced as the single string
+ *  'no assistant response found in transcript'. That collapsed a missing
+ *  project directory and a filesystem exception into the same line, which is
+ *  how a 35-run failure stayed undiagnosable: the reader could not tell "we
+ *  never wrote a transcript" from "we could not read one". Each case now
+ *  names itself. */
+export type HiddenClaudeFailure =
+  /** ~/.claude/projects/<key for cwd> does not exist — no session was ever recorded here. */
+  | 'project-dir-missing'
+  /** The directory exists but no .jsonl was written at or after the spawn. */
+  | 'no-fresh-transcript'
+  /** A transcript was found, but it holds no assistant text block. */
+  | 'no-assistant-text'
+  /** The transcript could not be read (permissions, race, malformed fs). */
+  | 'transcript-unreadable';
+
 export interface HiddenClaudeResult {
   ok: boolean;
   /** The assistant's final text response (stripped of any TUI framing). */
   text?: string;
   error?: string;
+  /** Which of the failure cases above this was. Absent on success. */
+  reason?: HiddenClaudeFailure;
+  /** The concrete path involved: the project directory, and the transcript file
+   *  when one existed. Its basename is the Claude session id. */
+  detail?: string;
 }
 
 /**
  * Extract the last assistant text block from the transcript JSONL written
  * at or after `spawnedAt`. Reuses projectDir() from transcript.ts.
+ *
+ * Returns which of the four failure cases applied rather than a bare null, so
+ * the caller can log something that actually distinguishes them.
+ *
+ * Exported for tests: the four branches are the whole point of this change and
+ * they are unreachable without spawning a real `claude`.
  */
-function extractLastAssistantText(cwd: string, spawnedAt: number): string | null {
-  try {
-    const dir = projectDir(cwd);
-    if (!existsSync(dir)) return null;
+export function extractLastAssistantText(
+  cwd: string, spawnedAt: number
+): { ok: true; text: string } | { ok: false; reason: HiddenClaudeFailure; detail: string } {
+  const dir = projectDir(cwd);
+  if (!existsSync(dir)) {
+    return { ok: false, reason: 'project-dir-missing', detail: dir };
+  }
 
-    const candidates: { f: string; mtime: number }[] = [];
+  const candidates: { f: string; mtime: number }[] = [];
+  try {
     for (const f of readdirSync(dir)) {
       if (!f.endsWith('.jsonl')) continue;
       try {
@@ -73,27 +107,42 @@ function extractLastAssistantText(cwd: string, spawnedAt: number): string | null
         if (mtime >= spawnedAt - 5000) candidates.push({ f, mtime });
       } catch { /* file removed between readdir and stat — skip */ }
     }
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => b.mtime - a.mtime);
+  } catch (e) {
+    return { ok: false, reason: 'transcript-unreadable', detail: `${dir} (${e})` };
+  }
+  if (!candidates.length) {
+    return { ok: false, reason: 'no-fresh-transcript', detail: dir };
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
 
-    const lines = readFileSync(path.join(dir, candidates[0].f), 'utf8').split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const trimmed = lines[i].trim();
-      if (!trimmed) continue;
-      let rec: { type?: unknown; message?: { content?: unknown[] } };
-      try { rec = JSON.parse(trimmed); } catch { continue; }
-      if (rec.type !== 'assistant') continue;
-      const content = rec.message?.content;
-      if (!Array.isArray(content)) continue;
-      for (let j = content.length - 1; j >= 0; j--) {
-        const block = content[j] as { type?: unknown; text?: unknown };
-        if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-          return block.text.trim();
-        }
+  const newest = candidates[0];
+  // The basename is the Claude session id, so quoting the file makes the log
+  // line answer "which session?" as well as "which directory?".
+  const newestPath = path.join(dir, newest.f);
+
+  let lines: string[];
+  try {
+    lines = readFileSync(newestPath, 'utf8').split('\n');
+  } catch (e) {
+    return { ok: false, reason: 'transcript-unreadable', detail: `${newestPath} (${e})` };
+  }
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+    let rec: { type?: unknown; message?: { content?: unknown[] } };
+    try { rec = JSON.parse(trimmed); } catch { continue; }
+    if (rec.type !== 'assistant') continue;
+    const content = rec.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (let j = content.length - 1; j >= 0; j--) {
+      const block = content[j] as { type?: unknown; text?: unknown };
+      if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+        return { ok: true, text: block.text.trim() };
       }
     }
-    return null;
-  } catch { return null; }
+  }
+  return { ok: false, reason: 'no-assistant-text', detail: newestPath };
 }
 
 export function runHiddenClaude(prompt: string, opts: HiddenClaudeOptions): Promise<HiddenClaudeResult> {
@@ -176,10 +225,20 @@ export function runHiddenClaude(prompt: string, opts: HiddenClaudeOptions): Prom
     };
 
     const captureAndFinish = () => {
-      const text = extractLastAssistantText(opts.cwd, spawnedAt);
-      finish(text
-        ? { ok: true, text }
-        : { ok: false, error: 'no assistant response found in transcript' });
+      const found = extractLastAssistantText(opts.cwd, spawnedAt);
+      if (found.ok) {
+        finish({ ok: true, text: found.text });
+        return;
+      }
+      // Name the case and the path. Before this, all four cases produced
+      // 'no assistant response found in transcript' and a reader had no way to
+      // tell a missing directory from an unreadable file.
+      finish({
+        ok: false,
+        reason: found.reason,
+        detail: found.detail,
+        error: `no assistant response found in transcript (${found.reason}): ${found.detail}`,
+      });
     };
 
     const sendPrompt = () => {
