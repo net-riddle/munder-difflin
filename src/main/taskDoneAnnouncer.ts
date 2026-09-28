@@ -24,9 +24,10 @@
 import type { TaskCard } from './realtimeCompletionWatcher';
 
 /** What a card just did. `start` is a card entering `doing`; `done` is a card
- *  reaching `done`. Both are transitions, never states — a card that sits in
- *  `doing` for an hour is announced once, on the way in. */
-export type TaskEventKind = 'start' | 'done';
+ *  reaching `done`; `blocked` is a card that needs a human. All are transitions,
+ *  never states — a card that sits in `doing` for an hour is announced once, on
+ *  the way in. */
+export type TaskEventKind = 'start' | 'done' | 'blocked';
 
 /**
  * One card observed to have just changed state.
@@ -74,6 +75,7 @@ const MAX_SEEN = 5_000;
 
 const DONE = 'done';
 const DOING = 'doing';
+const BLOCKED = 'blocked';
 
 /** Is this card in the finished state? Case-insensitive, and tolerant of the
  *  surrounding whitespace a hand-edited tasks.json tends to have. */
@@ -110,19 +112,33 @@ function titleOf(card: TaskCard): string {
 /**
  * What a card moving from `prev` to `next` means, or null for no news.
  *
- *  Only two moves are events, and both are deliberately narrow:
- *    → doing  a start. A card created as `todo` is a plan; `blocked` is a
- *            problem. Neither is work that has begun.
- *    → done   a finish.
+ * Three moves are events, and all are deliberately narrow:
+ *    → doing    a start. A card created as `todo` is a plan; `blocked` is a
+ *               problem. Neither is work that has begun.
+ *    → done     a finish.
+ *    → blocked  a card that now needs a human. This was MISSING, and its absence
+ *               was the whole point of the gap: the user was told when work
+ *               started and when it finished, and stayed silent at the one
+ *               moment they are actually needed.
  *
- *  Anything else — an assignee being set, a title being edited, a card moving
- *  back to `todo` — is silent, because this watcher runs every few seconds and
- *  a notification that repeats is worse than one that is missed.
+ * A `doing → blocked` card therefore announces TWICE: `start`, then `blocked`.
+ * That is deliberate, not a duplicate. The first says work began; the second
+ * says a person is required. Different facts, so the second is not a repeat —
+ * and the rule this module already states ("a notification that repeats is worse
+ * than one that is missed") is about repeating the SAME information. What it
+ * must not do is re-announce a card that is still blocked, and `seen` already
+ * guarantees that: a transition fires once, however long the card then sits
+ * there.
+ *
+ * Anything else — an assignee being set, a title being edited, a card moving
+ * back to `todo` — is silent, because this watcher runs every few seconds and
+ * a notification that repeats is worse than one that is missed.
  */
 export function transitionTo(prev: string, next: string): TaskEventKind | null {
   if (prev === next) return null;
   if (next === DONE) return 'done';
   if (next === DOING) return 'start';
+  if (next === BLOCKED) return 'blocked';
   return null;
 }
 

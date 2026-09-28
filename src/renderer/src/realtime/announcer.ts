@@ -50,7 +50,7 @@ let off: (() => void) | null = null;
  * the language behaviour without standing up a whole voice loop.
  */
 export function announceSentence(evt: {
-  kind: 'start' | 'done';
+  kind: 'start' | 'done' | 'blocked';
   who: string;
   title: string;
 }): string {
@@ -62,6 +62,15 @@ export function announceSentence(evt: {
     if (title) return t('announce.startedUnnamed', { title });
     if (who) return t('announce.startedNoTitle', { who });
     return t('announce.startedBare');
+  }
+  // A blocked card is the one the user has to act on, so it gets its own family
+  // rather than borrowing a finished one: "blocked" and "finished" are opposite
+  // facts and reusing the wording would tell them the opposite of the truth.
+  if (evt.kind === 'blocked') {
+    if (who && title) return t('announce.blocked', { who, title });
+    if (title) return t('announce.blockedUnnamed', { title });
+    if (who) return t('announce.blockedNoTitle', { who });
+    return t('announce.blockedBare');
   }
   if (who && title) return t('announce.finished', { who, title });
   if (title) return t('announce.finishedUnnamed', { title });

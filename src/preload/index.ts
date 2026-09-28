@@ -1342,12 +1342,13 @@ const api = {
     req?: { baseUrl?: string; model?: string; voice?: string; speed?: number; format?: string }
   ): Promise<{ ok: boolean; error?: string; bytes?: number }> =>
     ipcRenderer.invoke('realtime:speakTest', req ?? {}),
-/** A task card just changed state (main's taskDoneAnnouncer). `kind` is
-   *  'start' (entered `doing`) or 'done' (reached `done`). This is the
-   *  completion signal that does NOT depend on a voice session, so it fires
-   *  with no OpenAI involved. Subscribed by the local-voice announcer. */
+  /** A task card just changed state (main's taskDoneAnnouncer). `kind` is
+   *  'start' (entered `doing`), 'done' (reached `done`) or 'blocked' (now needs
+   *  a human). This is the completion signal that does NOT depend on a voice
+   *  session, so it fires with no OpenAI involved. Subscribed by the local-voice
+   *  announcer. */
   onTaskDone: (
-    cb: (evt: { taskId: string; kind: 'start' | 'done'; who: string; title: string; at: number }) => void
+    cb: (evt: { taskId: string; kind: 'start' | 'done' | 'blocked'; who: string; title: string; at: number }) => void
   ): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: Parameters<typeof cb>[0]) => cb(payload);
     ipcRenderer.on('task:done', listener);

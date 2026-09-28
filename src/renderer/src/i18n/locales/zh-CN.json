@@ -1422,6 +1422,10 @@
     "decodeFailed": "无法解码此图片——文件可能已损坏或扩展名有误"
   },
   "announce": {
+    "blocked": "{{who}} 被阻塞于：{{title}}。",
+    "blockedNoTitle": "{{who}} 有一个任务被阻塞。",
+    "blockedUnnamed": "一个任务被阻塞：{{title}}。",
+    "blockedBare": "一个任务被阻塞，需要你处理。",
     "finished": "{{who}} 完成了：{{title}}。",
     "finishedNoTitle": "{{who}} 完成了任务。",
     "finishedUnnamed": "任务完成：{{title}}。",

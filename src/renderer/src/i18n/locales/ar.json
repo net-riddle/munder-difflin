@@ -1422,6 +1422,10 @@
     "decodeFailed": "تعذّر فك ترميز هذه الصورة — قد يكون الملف تالفًا أو امتداده خاطئًا"
   },
   "announce": {
+    "blocked": "{{who}} عالق في: {{title}}.",
+    "blockedNoTitle": "لدى {{who}} مهمة عالقة.",
+    "blockedUnnamed": "مهمة عالقة: {{title}}.",
+    "blockedBare": "مهمة عالقة وتحتاجك.",
     "finished": "أنهى {{who}}: {{title}}.",
     "finishedNoTitle": "أنهى {{who}} مهمة.",
     "finishedUnnamed": "انتهت مهمة: {{title}}.",

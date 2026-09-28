@@ -1422,6 +1422,10 @@
     }
   },
   "announce": {
+    "blocked": "{{who}} è bloccato su: {{title}}.",
+    "blockedNoTitle": "{{who}} ha un task bloccato.",
+    "blockedUnnamed": "Un task è bloccato: {{title}}.",
+    "blockedBare": "Un task è bloccato e ha bisogno di te.",
     "finished": "{{who}} ha finito: {{title}}.",
     "finishedNoTitle": "{{who}} ha finito un task.",
     "finishedUnnamed": "Un task è finito: {{title}}.",

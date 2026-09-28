@@ -1422,6 +1422,10 @@
     "decodeFailed": "could not decode this image — the file may be corrupt or misnamed"
   },
   "announce": {
+    "blocked": "{{who}} is blocked on: {{title}}.",
+    "blockedNoTitle": "{{who}} has a task blocked.",
+    "blockedUnnamed": "A task is blocked: {{title}}.",
+    "blockedBare": "A task is blocked and needs you.",
     "finished": "{{who}} finished: {{title}}.",
     "finishedNoTitle": "{{who}} finished a task.",
     "finishedUnnamed": "A task finished: {{title}}.",
