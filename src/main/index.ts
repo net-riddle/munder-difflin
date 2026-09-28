@@ -5103,6 +5103,19 @@ function runWorkerWakeBeat(): void {
       halted: snap.halted
     });
   }
+  // The DECISION, not just the action. Before this, the only line this beat ever
+  // wrote was `nudging …`, so "the watchdog never ran" and "it ran and declined"
+  // and "it nudged" were one indistinguishable silence — and an agent sitting on
+  // undrained mail looked exactly like a healthy floor. Four incidents on the
+  // floor were needed before anyone noticed; the watchdog was working the whole
+  // time and simply could not be asked why not.
+  //
+  // Reasons are reported on CHANGE (see reasonsToReport), not every beat: at 15 s
+  // cadence an unconditional line is 4 per minute per agent, which is a log
+  // nobody reads, which is the same as no log at all.
+  for (const line of workerWake.reasonsToReport(facts, now)) {
+    console.log(`[worker-wake] declined ${line}`);
+  }
   for (const agentId of workerWake.decide(facts, now)) {
     const ptyId = ptyForAgent(agentId);
     if (!ptyId) continue;

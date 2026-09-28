@@ -90,6 +90,62 @@ export class WorkerWakeWatchdog {
   private lastNudgeAt = new Map<string, number>();
   /** agentId → timestamp of the last needsHuman hook notification. */
   private lastHumanNeedsAt = new Map<string, number>();
+  /** agentId → the reason string last reported for this agent (dedup for logs). */
+  private lastReason = new Map<string, string>();
+
+  /**
+   * Why this worker was not nudged, or `null` when it should be.
+   *
+   * PURE, and separate from `decide()` on purpose. `decide()` is the action, and
+   * the action was the only thing that ever got logged — so "the watchdog never
+   * ran", "it ran and declined" and "it nudged" were one indistinguishable
+   * silence, and an agent sitting on undrained mail looked exactly like a
+   * healthy floor. A guard you cannot ask "why not?" is a guard you cannot
+   * debug, and this one had four incidents on the floor before anyone noticed.
+   *
+   * The order matches `decide()` exactly, so the reason a caller logs is the
+   * reason the decision used.
+   */
+  explain(f: WorkerWakeFacts, now = Date.now()): string | null {
+    if (f.isGod) return 'god';
+    if (f.inboxCount <= 0) return null; // nothing to wake for: not a decline
+    if (!f.ptyId) return 'no-pty';
+    if (f.autoDeliveryPaused) return 'delivery-paused';
+    if (f.paused) return 'paused';
+    if (f.halted) return 'halted';
+    if (f.lastOutputAt <= 0) return 'never-output';
+    if (now - f.lastOutputAt < WORKER_WAKE_IDLE_MS) return 'mid-turn';
+    const spawned = this.spawnedAt.get(f.ptyId) ?? 0;
+    if (spawned > 0 && now - spawned < WORKER_WAKE_BOOT_GRACE_MS) return 'boot-grace';
+    const lastHuman = this.lastHumanNeedsAt.get(f.agentId) ?? 0;
+    if (lastHuman > 0 && now - lastHuman < WORKER_WAKE_HITL_REARM_MS) return 'hitl-rearm';
+    const lastNudge = this.lastNudgeAt.get(f.agentId) ?? 0;
+    if (lastNudge > 0 && now - lastNudge < WORKER_WAKE_COOLDOWN_MS) return 'cooldown';
+    return null;
+  }
+
+  /**
+   * Reasons worth writing down: this worker's reason changed since the last beat.
+   *
+   * The beat runs every 15 s, so an unconditional line would be 4 per minute per
+   * agent — a log nobody reads, which is the same as no log. Logging on CHANGE
+   * is what makes a stuck worker legible after the fact: the line stays there
+   * saying `hitl-rearm` for as long as it is true, without shouting every beat.
+   */
+  reasonsToReport(facts: readonly WorkerWakeFacts[], now = Date.now()): string[] {
+    const out: string[] = [];
+    for (const f of facts) {
+      const reason = this.explain(f, now);
+      if (reason === null) continue;
+      if (this.lastReason.get(f.agentId) === reason) continue;
+      this.lastReason.set(f.agentId, reason);
+      out.push(`${f.agentId} ${reason}`);
+    }
+    // An agent whose reason cleared must be forgotten, or it can never report
+    // the same reason twice: the state would be stale in the direction that hides.
+    for (const f of facts) if (this.explain(f, now) === null) this.lastReason.delete(f.agentId);
+    return out;
+  }
 
   /** Record a PTY spawn so its boot sequence is left alone. */
   noteSpawn(ptyId: string, at = Date.now()): void {
@@ -106,6 +162,7 @@ export class WorkerWakeWatchdog {
   forget(agentId: string, ptyId?: string): void {
     this.lastNudgeAt.delete(agentId);
     this.lastHumanNeedsAt.delete(agentId);
+    this.lastReason.delete(agentId);
     if (ptyId) this.spawnedAt.delete(ptyId);
   }
 
