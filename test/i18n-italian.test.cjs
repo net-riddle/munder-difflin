@@ -42,12 +42,21 @@ test('(1) every language has exactly the English key set', () => {
   }
 });
 
-test('(1) every language translates every one of the 8 spoken sentences', () => {
+test('(1) every language translates every one of the 12 spoken sentences', () => {
   // These are the only strings the voice ever says. A missing one means the TTS
   // server receives the raw key ("announce.finished") and reads it out loud.
+  //
+  // COUNT CORRECTED, 8 -> 12, by task-jim-057. The four `blocked` sentences were
+  // added when a card that needs a human started making a sound, and this
+  // assertion was the thing that noticed — the voice had been asked for it and
+  // every other check still passed, because the other checks compare languages
+  // to each other and the four new keys went into ALL of them at once. A guard
+  // that only compares peers cannot see a change that was made everywhere.
+  // The count is kept precisely because it is the one check that is not a
+  // comparison: it says how many strings the voice is allowed to have.
   const en = read('en.json').announce;
   const keys = Object.keys(en);
-  assert.equal(keys.length, 8);
+  assert.equal(keys.length, 12, 'eight start/finish sentences plus four for `blocked`');
   for (const file of ['it.json', 'ar.json', 'zh-CN.json']) {
     const a = read(file).announce;
     assert.deepEqual(Object.keys(a).sort(), keys.slice().sort(), `${file} announce keys differ`);
