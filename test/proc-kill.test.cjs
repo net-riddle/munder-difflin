@@ -2,9 +2,15 @@
 /**
  * procKill tests — prove the PID-release hardening works on a REAL process
  * tree. Self-contained, no framework — run with `node test/proc-kill.test.cjs`
- * (mirrors test/breaker.test.cjs). POSIX-only assertions (the Windows path is
- * `taskkill /T /F`, exercised in CI on a Windows runner if ever added); on
- * win32 this file exits 0 after a smoke import.
+ * (mirrors test/breaker.test.cjs). Every case here is POSIX-only (the Windows
+ * path is `taskkill /T /F`, exercised in CI on a Windows runner if ever added).
+ *
+ * On win32 these cases are reported as SKIPPED, not passed. The earlier shape was
+ * `if (win32) { console.log('ok'); process.exit(0); }`, and that reports one
+ * green node for five tests that never ran — a green for code that was never
+ * executed is worse than an honest red, because the count says the work is done.
+ * A `skip` says "0 executed, 5 skipped", and the number moves on Windows on
+ * purpose: that movement is the information.
  *
  * Scenario mirroring the leak: a session leader that IGNORES SIGHUP (like a
  * wedged TUI) with a live child of its own. A bare pty kill() leaves both
@@ -26,10 +32,15 @@ const js = ts.transpileModule(fs.readFileSync(SRC, 'utf8'), {
 fs.writeFileSync(path.join(out, 'procKill.js'), js, 'utf8');
 const { isAlive, hardKillTree, ensureKilled } = require(path.join(out, 'procKill.js'));
 
-if (process.platform === 'win32') {
-  console.log('  ok  (win32: smoke import only — POSIX group semantics not applicable)');
-  process.exit(0);
-}
+/**
+ * The POSIX-only gate, as a `skip` reason rather than an early exit.
+ *
+ * The import above still ran on every platform, so the transpile-and-load path
+ * stays covered everywhere; what is skipped is the process-tree behaviour, which
+ * genuinely has no meaning without a process group.
+ */
+const POSIX_ONLY = 'win32: the Windows path is taskkill /T /F, not POSIX process groups';
+const skipOnWin = process.platform === 'win32';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -50,7 +61,7 @@ function spawnStubbornTree() {
 
 const { test } = require('node:test');
 
-test('isAlive: true for a live process, false after it dies', async () => {
+test('isAlive: true for a live process, false after it dies', { skip: skipOnWin ? POSIX_ONLY : false }, async () => {
   const pid = spawnStubbornTree();
   await sleep(200);
   assert.ok(isAlive(pid), 'leader should be alive');
@@ -59,7 +70,7 @@ test('isAlive: true for a live process, false after it dies', async () => {
   assert.ok(!isAlive(pid), 'leader should be dead after hardKillTree');
 });
 
-test('hardKillTree reaps the WHOLE group, not just the leader', async () => {
+test('hardKillTree reaps the WHOLE group, not just the leader', { skip: skipOnWin ? POSIX_ONLY : false }, async () => {
   const pid = spawnStubbornTree();
   await sleep(300);
   const before = groupPids(pid);
@@ -69,7 +80,7 @@ test('hardKillTree reaps the WHOLE group, not just the leader', async () => {
   assert.deepEqual(groupPids(pid), [], 'group should be empty');
 });
 
-test('SIGHUP alone does NOT kill the stubborn leader (the leak)', async () => {
+test('SIGHUP alone does NOT kill the stubborn leader (the leak)', { skip: skipOnWin ? POSIX_ONLY : false }, async () => {
   const pid = spawnStubbornTree();
   await sleep(200);
   try { process.kill(pid, 'SIGHUP'); } catch { /* noop */ }
@@ -78,7 +89,7 @@ test('SIGHUP alone does NOT kill the stubborn leader (the leak)', async () => {
   hardKillTree(pid); // cleanup
 });
 
-test('ensureKilled escalates after the grace and releases every PID', async () => {
+test('ensureKilled escalates after the grace and releases every PID', { skip: skipOnWin ? POSIX_ONLY : false }, async () => {
   const pid = spawnStubbornTree();
   await sleep(200);
   try { process.kill(pid, 'SIGHUP'); } catch { /* noop */ } // the polite kill that gets ignored
@@ -88,7 +99,7 @@ test('ensureKilled escalates after the grace and releases every PID', async () =
   assert.deepEqual(groupPids(pid), [], 'no survivors in the group');
 });
 
-test('ensureKilled tolerates bad pids', async () => {
+test('ensureKilled tolerates bad pids', { skip: skipOnWin ? POSIX_ONLY : false }, async () => {
   ensureKilled(undefined);
   ensureKilled(-5);
   ensureKilled(0);
