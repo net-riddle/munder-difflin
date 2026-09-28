@@ -16,11 +16,7 @@ const { spawnSync } = require('node:child_process');
 const kg = require('../src/main/kg-core.cjs');
 const CLI = path.join(__dirname, '..', 'resources', 'kg.cjs');
 
-let failures = 0;
-function test(name, fn) {
-  try { fn(); console.log(`  ✓ ${name}`); }
-  catch (err) { failures++; console.log(`  ✗ ${name}\n     ${err && err.message}`); }
-}
+const { test } = require('node:test');
 
 function tmpRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kg-test-'));
@@ -195,10 +191,4 @@ function writeFixture(dir, name, content) {
     assert.ok(/not configured|off|unavailable/i.test(res.stderr + res.stdout), 'explains it is off');
   });
 
-  // ─── summary ────────────────────────────────────────────────────────────
-  if (failures > 0) {
-    console.log(`\n${failures} test(s) failed`);
-    process.exit(1);
-  }
-  console.log('\nAll knowledge-graph tests passed');
 })();

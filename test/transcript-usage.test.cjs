@@ -53,11 +53,7 @@ function rec(output, opts = {}) {
   });
 }
 
-let failures = 0;
-function test(name, fn) {
-  try { fn(); console.log(`  ok  ${name}`); }
-  catch (e) { failures++; console.error(`FAIL  ${name}\n      ${e.message}`); }
-}
+const { test } = require('node:test');
 
 test('sums usage across records and files', () => {
   const { cwd, dir } = makeProject();
@@ -145,4 +141,3 @@ test('missing project dir yields zeros', () => {
   assert.equal(u.estimatedCostUsd, 0);
 });
 
-process.exit(failures ? 1 : 0);

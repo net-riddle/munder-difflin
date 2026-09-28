@@ -48,57 +48,50 @@ function spawnStubbornTree() {
   return proc.pid;
 }
 
-let failures = 0;
-async function test(name, fn) {
-  try { await fn(); console.log(`  ok  ${name}`); }
-  catch (e) { failures++; console.error(`FAIL  ${name}\n      ${e.message}`); }
-}
+const { test } = require('node:test');
 
-(async () => {
-  await test('isAlive: true for a live process, false after it dies', async () => {
-    const pid = spawnStubbornTree();
-    await sleep(200);
-    assert.ok(isAlive(pid), 'leader should be alive');
-    hardKillTree(pid);
-    await sleep(200);
-    assert.ok(!isAlive(pid), 'leader should be dead after hardKillTree');
-  });
+test('isAlive: true for a live process, false after it dies', async () => {
+  const pid = spawnStubbornTree();
+  await sleep(200);
+  assert.ok(isAlive(pid), 'leader should be alive');
+  hardKillTree(pid);
+  await sleep(200);
+  assert.ok(!isAlive(pid), 'leader should be dead after hardKillTree');
+});
 
-  await test('hardKillTree reaps the WHOLE group, not just the leader', async () => {
-    const pid = spawnStubbornTree();
-    await sleep(300);
-    const before = groupPids(pid);
-    assert.ok(before.length >= 2, `expected leader+child in group, saw: ${before.join(',')}`);
-    hardKillTree(pid);
-    await sleep(300);
-    assert.deepEqual(groupPids(pid), [], 'group should be empty');
-  });
+test('hardKillTree reaps the WHOLE group, not just the leader', async () => {
+  const pid = spawnStubbornTree();
+  await sleep(300);
+  const before = groupPids(pid);
+  assert.ok(before.length >= 2, `expected leader+child in group, saw: ${before.join(',')}`);
+  hardKillTree(pid);
+  await sleep(300);
+  assert.deepEqual(groupPids(pid), [], 'group should be empty');
+});
 
-  await test('SIGHUP alone does NOT kill the stubborn leader (the leak)', async () => {
-    const pid = spawnStubbornTree();
-    await sleep(200);
-    try { process.kill(pid, 'SIGHUP'); } catch { /* noop */ }
-    await sleep(300);
-    assert.ok(isAlive(pid), 'a HUP-trapping leader survives a bare SIGHUP — this is the leaked-PID case');
-    hardKillTree(pid); // cleanup
-  });
+test('SIGHUP alone does NOT kill the stubborn leader (the leak)', async () => {
+  const pid = spawnStubbornTree();
+  await sleep(200);
+  try { process.kill(pid, 'SIGHUP'); } catch { /* noop */ }
+  await sleep(300);
+  assert.ok(isAlive(pid), 'a HUP-trapping leader survives a bare SIGHUP — this is the leaked-PID case');
+  hardKillTree(pid); // cleanup
+});
 
-  await test('ensureKilled escalates after the grace and releases every PID', async () => {
-    const pid = spawnStubbornTree();
-    await sleep(200);
-    try { process.kill(pid, 'SIGHUP'); } catch { /* noop */ } // the polite kill that gets ignored
-    ensureKilled(pid, 400);
-    await sleep(1200);
-    assert.ok(!isAlive(pid), 'leader must be gone after escalation');
-    assert.deepEqual(groupPids(pid), [], 'no survivors in the group');
-  });
+test('ensureKilled escalates after the grace and releases every PID', async () => {
+  const pid = spawnStubbornTree();
+  await sleep(200);
+  try { process.kill(pid, 'SIGHUP'); } catch { /* noop */ } // the polite kill that gets ignored
+  ensureKilled(pid, 400);
+  await sleep(1200);
+  assert.ok(!isAlive(pid), 'leader must be gone after escalation');
+  assert.deepEqual(groupPids(pid), [], 'no survivors in the group');
+});
 
-  await test('ensureKilled tolerates bad pids', async () => {
-    ensureKilled(undefined);
-    ensureKilled(-5);
-    ensureKilled(0);
-    ensureKilled(1.5);
-  });
+test('ensureKilled tolerates bad pids', async () => {
+  ensureKilled(undefined);
+  ensureKilled(-5);
+  ensureKilled(0);
+  ensureKilled(1.5);
+});
 
-  process.exit(failures ? 1 : 0);
-})();

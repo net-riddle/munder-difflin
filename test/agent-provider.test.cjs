@@ -27,11 +27,7 @@ for (const name of ['claudeCommands', 'codexCommands', 'grokCommands', 'agentPro
 }
 const ap = require(path.join(out, 'agentProvider.js'));
 
-let failures = 0;
-function test(name, fn) {
-  try { fn(); console.log(`  ✓ ${name}`); }
-  catch (err) { failures++; console.log(`  ✗ ${name}\n     ${err && err.message}`); }
-}
+const { test } = require('node:test');
 
 console.log('agent-provider registry tests');
 
@@ -93,8 +89,3 @@ test('codex preset still resolves (no regression)', () => {
   assert.strictEqual(ap.providerPreset('codex').defaultCommand, 'codex');
 });
 
-if (failures > 0) {
-  console.log(`\n${failures} test(s) failed`);
-  process.exit(1);
-}
-console.log('\nAll agent-provider tests passed');

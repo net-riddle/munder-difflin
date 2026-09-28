@@ -87,16 +87,7 @@ function activityNewestFirst(lines, n) {
 }
 
 // ── harness (mirrors test/realtime-findcard.test.cjs) ────────────────────────
-let failures = 0;
-function test(name, fn) {
-  try {
-    fn();
-    console.log(`  ✓ ${name}`);
-  } catch (err) {
-    failures++;
-    console.log(`  ✗ ${name}\n     ${err.message}`);
-  }
-}
+const { test } = require('node:test');
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 const mk = (over) => ({
@@ -243,5 +234,3 @@ test('redact: tolerates non-string input', () => {
   assert.strictEqual(redactSecrets(''), '');
 });
 
-console.log(`\n${failures ? failures + ' FAILED' : 'all passed'}.`);
-process.exit(failures ? 1 : 0);

@@ -4,16 +4,7 @@ const assert = require('assert');
 const { shouldTrigger, ActivatedThreads, SeenEvents, dedupKey, ACTIVATED_THREADS_MAX, SEEN_EVENTS_MAX, MAX_FILES_PER_MESSAGE } =
   require('../src/main/slack-trigger.cjs');
 
-let failures = 0;
-async function test(name, fn) {
-  try {
-    await fn();
-    console.log(`  ✓ ${name}`);
-  } catch (err) {
-    failures++;
-    console.log(`  ✗ ${name}\n     ${err.message}`);
-  }
-}
+const { test } = require('node:test');
 
 const BOT_ID = 'U12345BOT';
 const CHANNEL = 'C99999';
@@ -407,6 +398,4 @@ function ev(overrides = {}) {
     assert.strictEqual(fires, 2, 'distinct ts values each fire once');
   });
 
-  console.log(failures === 0 ? '\nall passed' : `\n${failures} failure(s)`);
-  process.exit(failures === 0 ? 0 : 1);
 })();

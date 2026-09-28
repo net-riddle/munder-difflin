@@ -71,16 +71,7 @@ const TASKS = [
 const find = (q) => findCard(TASKS, q);
 
 // ── harness (mirrors test/slack.test.cjs) ────────────────────────────────────
-let failures = 0;
-function test(name, fn) {
-  try {
-    fn();
-    console.log(`  ✓ ${name}`);
-  } catch (err) {
-    failures++;
-    console.log(`  ✗ ${name}\n     ${err.message}`);
-  }
-}
+const { test } = require('node:test');
 
 console.log('realtime findCard matcher tests (hyphen/punct, truncation, reorder, ambiguity)');
 
@@ -123,5 +114,3 @@ test('no-match: "buy groceries" -> none', () => {
   assert.ok(!r.ambiguous);
 });
 
-console.log(`\n${failures ? failures + ' FAILED' : 'all passed'}.`);
-process.exit(failures ? 1 : 0);

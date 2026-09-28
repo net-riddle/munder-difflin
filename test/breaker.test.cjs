@@ -31,11 +31,7 @@ const js = ts.transpileModule(fs.readFileSync(SRC, 'utf8'), {
 fs.writeFileSync(path.join(out, 'breaker.js'), js, 'utf8');
 const { CircuitBreaker } = require(path.join(out, 'breaker.js'));
 
-let failures = 0;
-function test(name, fn) {
-  try { fn(); console.log(`  ok  ${name}`); }
-  catch (e) { failures++; console.error(`FAIL  ${name}\n      ${e.message}`); }
-}
+const { test } = require('node:test');
 
 /** A breaker with fixed config (no caps, hardStop off). */
 function makeBreaker(over = {}) {
@@ -289,4 +285,3 @@ test('an empty object is a real value and still counts as a repeat', () => {
   assert.equal(d.state.level, 'steering', `reason: ${d.state.reason}`);
 });
 
-process.exit(failures ? 1 : 0);
