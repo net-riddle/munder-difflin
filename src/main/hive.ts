@@ -2952,7 +2952,7 @@ process.stdin.on('end', () => {
     transcript_path: agy.transcriptPath,
     cwd: Array.isArray(agy.workspacePaths) ? agy.workspacePaths[0] : undefined,
     tool_name: tc.name,
-    tool_input: tc.args
+    tool_input: tc.args ?? {}
   };
   let resp = '';
   const done = () => {
@@ -3011,7 +3011,7 @@ function register(pi) {
       if (AUTO) { try { if (ev && typeof ev.approve === 'function') ev.approve(); } catch (e) {} return { approve: true }; }
       return undefined;
     });
-    pi.on('tool_result', function (ev) { post({ hook_event_name: 'PostToolUse', tool_name: ev && (ev.name || (ev.tool && ev.tool.name)) }); });
+    pi.on('tool_result', function (ev) { post({ hook_event_name: 'PostToolUse', tool_name: ev && (ev.name || (ev.tool && ev.tool.name)), tool_input: (ev && (ev.args || ev.input)) ?? {} }); });
     pi.on('agent_end', function () { post({ hook_event_name: 'Stop' }); });
     return true;
   } catch (e) { return false; }
@@ -3045,11 +3045,11 @@ export const HiveBridge = async () => {
     event: async (input) => {
       try { if (input && input.event && input.event.type === 'session.idle') post({ hook_event_name: 'Stop' }); } catch (e) {}
     },
-    'tool.execute.before': async (input) => {
-      try { post({ hook_event_name: 'PreToolUse', tool_name: input && (input.tool || input.name) }); } catch (e) {}
+    'tool.execute.before': async (input, output) => {
+      try { post({ hook_event_name: 'PreToolUse', tool_name: input && (input.tool || input.name), tool_input: (output && output.args) ?? (input && input.args) ?? {} }); } catch (e) {}
     },
     'tool.execute.after': async (input) => {
-      try { post({ hook_event_name: 'PostToolUse', tool_name: input && (input.tool || input.name) }); } catch (e) {}
+      try { post({ hook_event_name: 'PostToolUse', tool_name: input && (input.tool || input.name), tool_input: (input && input.args) ?? {} }); } catch (e) {}
     }
   };
 };
