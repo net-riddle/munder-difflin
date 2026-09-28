@@ -21,7 +21,8 @@
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, renameSync,
   readdirSync, statSync, lstatSync, realpathSync, rmSync, appendFileSync,
-  symlinkSync, unlinkSync, copyFileSync, cpSync, chmodSync
+  symlinkSync, unlinkSync, copyFileSync, cpSync, chmodSync,
+  openSync, readSync, closeSync
 } from 'node:fs';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
 import { homedir } from 'node:os';
@@ -1685,6 +1686,44 @@ export class HiveManager {
     const root = this.root();
     return root && existsSync(join(root, 'board.md')) ? readFileSync(join(root, 'board.md'), 'utf8') : '';
   }
+  /** The first `maxLines` lines of board.md, reading only as many BYTES as that
+   *  actually needs.
+   *
+   *  board() reads the whole file. The heartbeat beat was calling it, trimming to
+   *  10 lines AFTER the read, and running every 2 minutes (30 s when the floor
+   *  looks stuck) — so 121 KB was read and 99.9% discarded on every beat. The
+   *  sibling `logTail()` had the same shape and the same fix, which is why the
+   *  read helper lives next to it. */
+  boardHead(maxLines = 10): string {
+    const root = this.root();
+    if (!root) return '';
+    const p = join(root, 'board.md');
+    let size = 0;
+    try { size = statSync(p).size; } catch { return ''; }
+    if (size <= 0) return '';
+    // 8 KB comfortably holds 10 lines of a markdown board. Grows only when the
+    // file has fewer than maxLines newlines in it, i.e. very long lines.
+    let want = Math.min(size, 8 * 1024);
+    for (;;) {
+      let text = '';
+      let eof = false;
+      const buf = Buffer.allocUnsafe(want);
+      const fd = openSync(p, 'r');
+      try {
+        const got = readSync(fd, buf, 0, want, 0);
+        eof = got < want;
+        text = buf.subarray(0, got).toString('utf8');
+      } finally { closeSync(fd); }
+      const lines = text.split('\n');
+      // Without EOF the last element is a partial line, and it may end mid
+      // codepoint because we cut on a byte boundary. Drop it rather than report
+      // half a line (or a replacement char) as a whole one.
+      const usable = eof ? lines : lines.slice(0, -1);
+      if (usable.length > maxLines) return usable.slice(0, maxLines).join('\n').trim();
+      if (eof) return usable.join('\n').trim();
+      want = Math.min(size, want * 4);
+    }
+  }
   tasks(): unknown {
     const root = this.root();
     return root ? this.readJson(join(root, 'tasks.json'), { tasks: [] }) : { tasks: [] };
@@ -2435,8 +2474,45 @@ export class HiveManager {
   logTail(n = 200): unknown[] {
     const root = this.root();
     if (!root || !existsSync(join(root, 'log.jsonl'))) return [];
-    const lines = readFileSync(join(root, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
-    return lines.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+    return this.tailLines(join(root, 'log.jsonl'), n)
+      .map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+  }
+
+  /** Last `n` newline-delimited lines of a file, reading only the tail bytes.
+   *
+   *  logTail used to be readFileSync(whole file).trim().split('\n').slice(-n).
+   *  That is a whole-file allocation plus a whole-file array on every call, to
+   *  keep n lines — and the `n` in the signature made it look bounded. Callers:
+   *  the heartbeat beat (n=8, every 2 min) and the Memory Graph panel (n=60,
+   *  polled every 5 s). It is synchronous on the main process, so it also
+   *  stalls the UDS hook server that feeds the breaker.
+   *
+   *  This is not hypothetical: log.jsonl grew to 108 MB during the tasks.json
+   *  encoding incident, and every one of those calls allocated a 108 MB string
+   *  and a multi-hundred-thousand-element array to keep eight lines. */
+  private tailLines(p: string, n: number): string[] {
+    if (n <= 0) return [];
+    let size = 0;
+    try { size = statSync(p).size; } catch { return []; }
+    if (size <= 0) return [];
+    // Start wide enough for n normal lines, and grow if the tail is sparse.
+    let want = Math.min(size, Math.max(64 * 1024, n * 4096));
+    for (;;) {
+      let text = '';
+      let eof = false;
+      const buf = Buffer.allocUnsafe(want);
+      const fd = openSync(p, 'r');
+      try {
+        const got = readSync(fd, buf, 0, want, size - want);
+        eof = want >= size;
+        text = buf.subarray(0, got).toString('utf8');
+      } finally { closeSync(fd); }
+      // Unless we started at byte 0, the first element is a partial line.
+      const head = want >= size ? '' : text.slice(text.indexOf('\n') + 1);
+      const parts = (head + text.slice(head.length ? text.indexOf('\n') + 1 : 0)).split('\n').filter(Boolean);
+      if (parts.length > n || eof) return parts.slice(-n);
+      want = Math.min(size, want * 4);
+    }
   }
 
   private listMessages(dir: string): HiveMessage[] {

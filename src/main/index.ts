@@ -1063,7 +1063,7 @@ function buildHeartbeatDigest(quietMs: number, actionable = 0): string {
   const reg = hive.registry();
   const active = Object.entries(reg.agents).filter(([id, a]) => !a.archived && id !== reg.godId);
   const names = active.map(([, a]) => a.name).join(', ') || '—';
-  const boardHead = hive.board().split('\n').slice(0, 10).join('\n').trim();
+  const boardHead = hive.boardHead(10);
   const log = hive.logTail(8).map((e) => { try { return JSON.stringify(e); } catch { return ''; } }).filter(Boolean).join('\n');
   const withInbox = active.filter(([id]) => hive.inbox(id).length > 0).map(([, a]) => a.name);
   // When real agent/human mail is waiting, lead with an explicit call-to-action
