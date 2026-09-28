@@ -24,7 +24,7 @@ import {
   addWorktree, removeWorktree, worktreeHasUnintegratedWork, worktreeIsGcSafe,
   getLogGraph, getCommitFiles, getFileAtRev, compareRefs, listWorktrees, checkoutRef
 } from './git';
-import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
+import { HiveManager, UNDELIVERABLE_MARKER, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -1102,7 +1102,16 @@ function godActionableInboxCount(): number {
   try {
     const godId = hive.registry().godId;
     if (!godId) return 0;
-    return hive.inbox(godId).filter((m) => !SYSTEM_SENDERS.has(m.from)).length;
+    // A bounce is not actionable mail. It keeps the original sender as `from`, so
+    // for god's own misaddressed reply (`to: "scheduler"`, `to: "heartbeat"`) it
+    // arrives from god — which is not in SYSTEM_SENDERS — and was counted as
+    // actionable on every single pass. That made the heartbeat re-engage god
+    // once per bounced reply, indefinitely, each cycle re-reading board.md and
+    // log.jsonl. The inbox refills with a bounce nobody can act on, so treating
+    // it as actionable is a livelock, not a prompt.
+    return hive.inbox(godId).filter((m) =>
+      !SYSTEM_SENDERS.has(m.from) && !m.subject.startsWith(UNDELIVERABLE_MARKER)
+    ).length;
   } catch { return 0; }
 }
 

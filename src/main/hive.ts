@@ -291,6 +291,13 @@ export function redactSecrets(text: unknown): string {
 
 // ─── HiveManager ────────────────────────────────────────────────────────────
 
+/** Every undeliverable bounce is delivered to god with this marker prepended to a
+ *  rewritten subject. Exported so callers can recognise a bounce instead of
+ *  string-matching the literal: a bounce carries `from` = the original sender,
+ *  which for god's own misaddressed replies is god, so it is NOT in
+ *  SYSTEM_SENDERS and would otherwise be counted as actionable mail forever. */
+export const UNDELIVERABLE_MARKER = '[undeliverable';
+
 export class HiveManager {
   /**
    * @param getHome  Lazily resolve harnessHome so the hive follows config changes.
@@ -1574,6 +1581,12 @@ export class HiveManager {
         this.deliver({
           ...msg,
           to: godId,
+          // Count the bounce against the hop cap. It used to inherit msg.hops
+          // untouched, and HOP_CAP is only ever checked on the ROUTED path
+          // (line 1496) — this is a direct deliver() that never re-enters it.
+          // So a reply to an id that is not on the floor could bounce forever,
+          // completely uncapped, reusing the original msg.id each time.
+          hops: (msg.hops ?? 0) + 1,
           subject: `[undeliverable — no agent "${t}" on this floor; check the id against the roster] ${msg.subject}`
         }, godId);
       }
