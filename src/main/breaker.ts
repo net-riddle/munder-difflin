@@ -94,6 +94,12 @@ interface AgentBreakerState {
   /** Consecutive identical tool calls (same name+input). */
   repeatKey: string | null;
   repeatCount: number;
+  /** Calls that arrived with NO tool_input at all (undefined or null). They are
+   *  unidentifiable — there is no term to compare — so they are deliberately
+   *  kept OUT of repeatKey/repeatCount. Counted here anyway, because a stream
+   *  of them is a harness fault that belongs in the trip reason rather than
+   *  silently distorting the count. */
+  unidentifiedToolUses: number;
   /** Consecutive api_error / retry events with no intervening progress. */
   errorCount: number;
   /** Δoutput-based trips are exempt until this instant (compaction in flight,
@@ -140,7 +146,8 @@ export class CircuitBreaker {
     if (!s) {
       s = {
         level: 'healthy', reason: '', lastSample: null, repeatKey: null, repeatCount: 0,
-        errorCount: 0, compactingUntil: 0, lastDistinctToolAt: 0, noProgressBeats: 0
+        errorCount: 0, compactingUntil: 0, lastDistinctToolAt: 0, noProgressBeats: 0,
+        unidentifiedToolUses: 0
       };
       this.agents.set(agentId, s);
     }
@@ -164,6 +171,22 @@ export class CircuitBreaker {
    *  no-progress arm reads); the SAME key in a row is the loop signal. */
   recordToolUse(agentId: string, toolName: string | undefined, toolInput: unknown, now = Date.now()): void {
     const s = this.get(agentId);
+    // A call whose input NEVER ARRIVED cannot be compared with any other call.
+    // `toolKey` would hash the empty string and hand back one identical digest
+    // for everything, so "this is the same call as the last one" is not a
+    // conclusion available here — the term the comparison needs is missing.
+    // Counting it anyway is what turned any 8 tool calls into a loop: measured
+    // on the floor 2026-09-28 18:56-19:05Z, the trip reason read
+    // `8x identical tool call (Bash:e3b0c44298fc1c14)` — e3b0c442... being the
+    // SHA-256 of nothing — and the SAME digest appeared under `read:` as well,
+    // which is the tell: the tool name varied, the input never came. Skipping
+    // the counter also STOPS masking real loops, because an alternating
+    // unidentifiable call used to reset repeatKey and hide a genuine repeat.
+    // An empty object or empty string is a real value and still compared.
+    if (toolInput === undefined || toolInput === null) {
+      s.unidentifiedToolUses += 1;
+      return;
+    }
     const key = this.toolKey(toolName, toolInput);
     if (key === s.repeatKey) {
       s.repeatCount += 1;
@@ -337,7 +360,14 @@ export class CircuitBreaker {
       // outside. With toolKey now an exact digest, the suffix is a real
       // fingerprint — an operator can see the calls were byte-identical, and a
       // collision would be visible as a digest that never settles.
-      return { tripping: true, reason: `looping: ${s.repeatCount}× identical tool call (${s.repeatKey ?? '?'})` };
+      // Name the unidentifiable calls in the reason. A guard that aborts
+      // quietly is worth ten reviews, and a stream of calls with no
+      // tool_input is a harness fault that would otherwise read as "the agent
+      // looped" for ever.
+      const unseen = s.unidentifiedToolUses > 0
+        ? ` — plus ${s.unidentifiedToolUses} call(s) with NO tool_input, not comparable, not counted`
+        : '';
+      return { tripping: true, reason: `looping: ${s.repeatCount}× identical tool call (${s.repeatKey ?? '?'})${unseen}` };
     }
     // (b) api_error storm
     if (s.errorCount >= cfg.errorStormLimit) {

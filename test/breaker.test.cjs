@@ -221,4 +221,72 @@ test('a healthy beat de-escalates one level', () => {
   assert.equal(d.state.level, 'healthy');
 });
 
+// ── a call with NO input cannot be compared with any other call ───────────────
+// Regression for the self-feeding trip train of 2026-09-28 18:56-19:05Z. The
+// harness stopped delivering `tool_input`, so every PostToolUse arrived as
+// `undefined`. `safeStringify(undefined)` is '' (breaker.ts), so `toolKey`
+// hashed the EMPTY STRING and returned the same digest for every call —
+// `e3b0c442...`, the SHA-256 of nothing. The same digest appeared under
+// `bash:` AND under `read:`, which is the signature: the tool name varied, the
+// input never arrived. With repeatedToolLimit 8, ANY eight tool calls then
+// looked like a loop, and the agent was steered and constrained for work that
+// was not a loop. Counting a call whose comparison term is missing is not a
+// conclusion this function is entitled to draw.
+
+test('calls with no input are NOT counted as repeats (missing-input regression)', () => {
+  const b = makeBreaker();
+  for (let i = 0; i < 8; i++) b.recordToolUse('a', 'Bash', undefined);
+  const d = beat(b, 'a', null, true, T0);
+  assert.equal(d.state.level, 'healthy', `reason: ${d.state.reason}`);
+});
+
+test('the floor signature: same empty digest under DIFFERENT tool names is not a loop', () => {
+  const b = makeBreaker();
+  const names = ['Bash', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash', 'Read'];
+  names.forEach((n) => b.recordToolUse('a', n, undefined));
+  const d = beat(b, 'a', null, true, T0);
+  assert.equal(d.state.level, 'healthy', `reason: ${d.state.reason}`);
+});
+
+test('null input is treated as missing too, not as a value', () => {
+  const b = makeBreaker();
+  for (let i = 0; i < 8; i++) b.recordToolUse('a', 'Bash', null);
+  const d = beat(b, 'a', null, true, T0);
+  assert.equal(d.state.level, 'healthy', `reason: ${d.state.reason}`);
+});
+
+// The fix must not blind the arm. A genuine loop carries real arguments, so it
+// must still trip — including when input-less calls are interleaved with it.
+
+test('a REAL loop still trips with input-less calls interleaved', () => {
+  const b = makeBreaker();
+  for (let i = 0; i < 8; i++) {
+    b.recordToolUse('a', 'Bash', undefined);            // no input: not comparable
+    b.recordToolUse('a', 'Bash', { cmd: 'same' });      // real repeat
+  }
+  const d = beat(b, 'a', null, true, T0);
+  assert.equal(d.state.level, 'steering', `reason: ${d.state.reason}`);
+  assert.match(d.state.reason, /looping/);
+});
+
+test('a distinct call after input-less calls still clears the loop arm', () => {
+  const b = makeBreaker();
+  for (let i = 0; i < 8; i++) b.recordToolUse('a', 'Bash', { cmd: 'same' });
+  beat(b, 'a', null, true, T0);                         // → steering
+  for (let i = 0; i < 8; i++) b.recordToolUse('a', 'Read', undefined);
+  b.recordToolUse('a', 'Read', { file: 'new' });        // distinct, has input
+  const d = beat(b, 'a', null, true, T0 + BEAT);
+  assert.equal(d.state.level, 'healthy', `reason: ${d.state.reason}`);
+});
+
+// An empty OBJECT and an empty STRING are real values, not missing input: they
+// are comparable, and two of them are genuinely identical.
+
+test('an empty object is a real value and still counts as a repeat', () => {
+  const b = makeBreaker();
+  for (let i = 0; i < 8; i++) b.recordToolUse('a', 'Bash', {});
+  const d = beat(b, 'a', null, true, T0);
+  assert.equal(d.state.level, 'steering', `reason: ${d.state.reason}`);
+});
+
 process.exit(failures ? 1 : 0);
