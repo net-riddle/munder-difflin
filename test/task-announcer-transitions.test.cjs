@@ -191,7 +191,7 @@ test('the event carries facts, not a sentence', () => {
   assert.equal(e.title, 'fix the login bug');
 });
 
-test('the only two transitions are start and done', () => {
+test('the three transitions are start, done and blocked', () => {
   assert.equal(transitionTo('todo', 'doing'), 'start');
   assert.equal(transitionTo('doing', 'done'), 'done');
   assert.equal(transitionTo('blocked', 'done'), 'done');
@@ -199,5 +199,17 @@ test('the only two transitions are start and done', () => {
   assert.equal(transitionTo('done', 'doing'), 'start', 'a reopened card really does start again');
   assert.equal(transitionTo('done', 'done'), null);
   assert.equal(transitionTo('doing', 'todo'), null);
-  assert.equal(transitionTo('done', 'blocked'), null);
+  // CORRECTED, and the old assertion was the defect. This used to read
+  // `assert.equal(transitionTo('done', 'blocked'), null)`, under a test called
+  // "the only two transitions are start and done" — the suite certified as
+  // correct the exact behaviour the human reported as the bug: a card that needs
+  // a person produced no sound, so the user was told when work started and when
+  // it finished and heard nothing at the one moment they are needed. A test that
+  // pins a defect is worse than a missing one, because it makes the defect look
+  // intentional and blocks whoever fixes it.
+  assert.equal(transitionTo('done', 'blocked'), 'blocked', 'blocked is an event, not silence');
+  // And the rest of the blocked family, so the correction cannot be half-applied.
+  assert.equal(transitionTo('todo', 'blocked'), 'blocked');
+  assert.equal(transitionTo('doing', 'blocked'), 'blocked', 'a started card that blocks says both halves');
+  assert.equal(transitionTo('blocked', 'blocked'), null, 'but a card that stays blocked is announced once');
 });
