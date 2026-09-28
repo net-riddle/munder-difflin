@@ -323,4 +323,29 @@ export function registerRealtimeIpc(): void {
     logRealtime(`ERROR at ${where}: ${msg}`);
     return { ok: true };
   });
+
+  // What became of an announcement, reported by the renderer once the audio has
+  // actually finished — or not.
+  //
+  // THIS IS A RECEIVER, NOT A LIFECYCLE. It keeps no announcement state, opens no
+  // transaction, and nothing waits on a reply. That is the whole point: an
+  // announcement has no state in main to close, so building one for a consumer
+  // that does not exist yet would be a protocol pretending to be code. When a
+  // consumer appears, that is the moment to add the state — not before.
+  //
+  // What it buys today is the ability to SEE a `cut-short`, which used to die in
+  // the renderer: the user interrupted, or the clip hit the hard stop, and the
+  // sentence was not heard. A floor that cannot tell a delivered announcement
+  // from a cut one will eventually report the second as the first.
+  ipcMain.on('task:announcement-outcome', (_evt, payload: unknown) => {
+    const p = (payload ?? {}) as { taskId?: unknown; kind?: unknown; outcome?: unknown };
+    const outcome = p.outcome;
+    if (outcome !== 'played' && outcome !== 'cut-short' && outcome !== 'failed') return;
+    const taskId = typeof p.taskId === 'string' ? p.taskId.slice(0, 64) : '?';
+    const kind = typeof p.kind === 'string' ? p.kind.slice(0, 16) : '?';
+    // Only the two that mean the user did not hear it get the loud tag. Logging
+    // every success would bury them within a day of notifications.
+    const tag = outcome === 'played' ? 'announce' : 'announce-incomplete';
+    logRealtime(`${tag} ${taskId} ${kind} -> ${outcome}`);
+  });
 }

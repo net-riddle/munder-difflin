@@ -42,6 +42,31 @@ function emit(ev: LocalVoiceEvent): void {
   }
 }
 
+/**
+ * What became of one spoken line. THREE values, not two, and the third is why
+ * this type exists at all.
+ *
+ *   played     the media element reached its own `ended`: the user heard all of it.
+ *   cut-short  playback began and did not finish — barge-in, the generation
+ *              guard, or the hard-stop watchdog. **NOT heard.** Saying so is the
+ *              entire point: count a cut announcement as spoken and we tell the
+ *              user they heard something at the exact moment they were not
+ *              listening, which is the failure the human described.
+ *   failed     it never became audible: synthesis error, decode failure, or
+ *              autoplay refused.
+ *
+ * A line is split into sentence clips, so a line can play half and then be cut.
+ * The line's outcome is the WORST of its clips, never the last one.
+ */
+export type SpeakOutcome = 'played' | 'cut-short' | 'failed';
+
+const SEVERITY: Record<SpeakOutcome, number> = { played: 0, 'cut-short': 1, failed: 2 };
+
+/** The worse of two outcomes: a line is only `played` if every clip was. */
+export function worseOutcome(a: SpeakOutcome, b: SpeakOutcome): SpeakOutcome {
+  return SEVERITY[b] > SEVERITY[a] ? b : a;
+}
+
 /** Subscribe to the queue's lifecycle (speaking / idle / error / interrupted).
  *  Returns an unsubscribe. Listeners must never throw — one that does would
  *  otherwise take the voice loop down with it, so they are isolated. */
@@ -57,6 +82,10 @@ let queue: string[] = [];
 /** The <audio> element TTS clips play through (chosen speaker sink). */
 let audioEl: HTMLAudioElement | null = null;
 let pumping = false;
+/** Callers waiting to be told what became of the line they asked to speak.
+ *  Drained by the pump run that plays it — including a run that was already in
+ *  flight, because their chunks are already in its queue. */
+const outcomeWaiters: Array<(o: SpeakOutcome) => void> = [];
 /** Bumped on every cancel/teardown so an in-flight playback loop can tell that
  *  the session it belonged to is gone. */
 let generation = 0;
@@ -144,10 +173,18 @@ export function isLocalVoiceBusy(): boolean {
  */
 let cancelActiveClip: (() => void) | null = null;
 
-/** Play one clip and resolve when it ends (or is cut short). Never rejects: a
- *  decode failure must not take the voice loop down with it. */
-function playClip(el: HTMLAudioElement, b64: string, mime: string, gen: number): Promise<void> {
-  return new Promise<void>((resolve) => {
+/** Play one clip and resolve with what happened to it. Never rejects: a
+ *  decode failure must not take the voice loop down with it.
+ *
+ *  WHY IT REPORTS, AND WHY IT HAS THREE ANSWERS. Every exit below used to call
+ *  the same `done()` and resolve `undefined`, which is why `speakLine` could only
+ *  return `void`: the process possessed this fact and discarded it. `ended` is
+ *  the ONLY evidence that the user heard the whole line. A cancel, the
+ *  generation guard and the watchdog all mean the opposite, and `error` means
+ *  nothing was audible at all — three genuinely different facts, so three values
+ *  rather than a boolean that would have to lie about one of them. */
+function playClip(el: HTMLAudioElement, b64: string, mime: string, gen: number): Promise<SpeakOutcome> {
+  return new Promise<SpeakOutcome>((resolve) => {
     let settled = false;
     // Declared BEFORE `done` uses it. It used to be declared after, so the
     // decode-failure path — which calls done() early — hit the temporal dead
@@ -156,25 +193,31 @@ function playClip(el: HTMLAudioElement, b64: string, mime: string, gen: number):
     let timer: ReturnType<typeof setTimeout> | null = null;
     let url: string | null = null;
 
-    const done = (): void => {
+    const done = (outcome: SpeakOutcome): void => {
       if (settled) return;
       settled = true;
       if (timer !== null) clearTimeout(timer);
       timer = null;
-      el.removeEventListener('ended', done);
-      el.removeEventListener('error', done);
+      el.removeEventListener('ended', onEnded);
+      el.removeEventListener('error', onError);
       if (cancelActiveClip === release) cancelActiveClip = null;
       // The object URL is revoked HERE, per clip, rather than at teardown: a
-      // backlog of notifications would otherwise hold every clip's bytes for
-      // the life of the window. Revoking is idempotent per URL and safe to call
+      // backlog of notifications would otherwise hold every clip's bytes for the
+      // life of the window. Revoking is idempotent per URL and safe to call
       // after the element has finished with it.
       if (url) {
         URL.revokeObjectURL(url);
         url = null;
       }
-      resolve();
+      resolve(outcome);
     };
-    const release = done;
+    // Named, because they are handed to addEventListener AND removeEventListener
+    // and the two must be the same reference or the listener never comes off.
+    const onEnded = (): void => done('played');
+    const onError = (): void => done('failed');
+    // A cancel is barge-in: the user stopped us. Playback had begun and will not
+    // finish, which is `cut-short` and emphatically not `played`.
+    const release = (): void => done('cut-short');
 
     // A BLOB, not a `data:` URL. The renderer's Content-Security-Policy
     // declares `media-src 'self' blob: mediastream:` — `data:` is NOT in that
@@ -186,7 +229,8 @@ function playClip(el: HTMLAudioElement, b64: string, mime: string, gen: number):
       url = URL.createObjectURL(new Blob([bytes], { type: mime }));
     } catch {
       // Malformed base64 from the bridge: release and keep the queue going.
-      done();
+      // Nothing was ever audible, so this is `failed`, not a silent `played`.
+      done('failed');
       return;
     }
 
@@ -197,16 +241,19 @@ function playClip(el: HTMLAudioElement, b64: string, mime: string, gen: number):
       } catch {
         /* ignore */
       }
-      done();
+      // The hard stop truncated a clip that had not reached its end, so the user
+      // did not hear all of it. `cut-short`, and the conservative reading is the
+      // right one: the alternative is claiming more than we know.
+      done('cut-short');
     }, CLIP_HARD_STOP_MS);
-    el.addEventListener('ended', done);
-    el.addEventListener('error', done);
+    el.addEventListener('ended', onEnded);
+    el.addEventListener('error', onError);
     el.src = url;
     // Autoplay can be refused until the user has interacted with the window.
     // The rejection is swallowed: the clip is skipped, the loop continues.
-    void el.play().catch(() => done());
+    void el.play().catch(() => done('failed'));
     // A cancel between the click and the play must still stop this clip.
-    if (gen !== generation) done();
+    if (gen !== generation) done('cut-short');
   });
 }
 
@@ -215,6 +262,10 @@ async function pump(): Promise<void> {
   pumping = true;
   const gen = generation;
   emit({ type: 'speaking' });
+  // Aggregate over the WHOLE run, not the last clip: a line split into
+  // sentences that plays two and is then cut has not been heard, and taking only
+  // the final outcome would report it as played.
+  let worst: SpeakOutcome = 'played';
   try {
     while (queue.length && gen === generation) {
       const line = queue.shift();
@@ -226,33 +277,52 @@ async function pump(): Promise<void> {
       // A cancel during the synthesis round-trip drops the clip AND the rest of
       // the turn: the user interrupted, so the rest of the sentence is not
       // something they want to hear.
-      if (gen !== generation) { queue = []; break; }
+      if (gen !== generation) { queue = []; worst = worseOutcome(worst, 'cut-short'); break; }
       if (!res.ok) {
         // The common failure is the TTS server being down; it has no UI of its
         // own, so it lands in the same on-disk log as the session failures.
         void window.cth.realtimeLogError?.('tts', res.error).catch(() => { /* best-effort */ });
         emit({ type: 'error', error: res.error });
+        worst = worseOutcome(worst, 'failed');
         continue;
       }
       // Lazily created when the announcer speaks without a session.
       const el = ensureSink();
-      if (!el) continue;
-      await playClip(el, res.audio, res.mime, gen);
+      if (!el) { worst = worseOutcome(worst, 'failed'); continue; }
+      worst = worseOutcome(worst, await playClip(el, res.audio, res.mime, gen));
     }
   } finally {
     pumping = false;
     if (gen === generation) emit({ type: 'idle' });
+    // Everything queued at the end of this run now has an answer, including the
+    // ones a barge-in dropped: they were cut short, not played.
+    const answer = gen === generation ? worst : worseOutcome(worst, 'cut-short');
+    const pending = outcomeWaiters.splice(0, outcomeWaiters.length);
+    for (const w of pending) {
+      try { w(answer); } catch { /* a waiter must not break the voice loop */ }
+    }
   }
 }
 
 /** Speak a whole line at once — a completion notice, in practice. Split on
  *  sentences so a long objective is a sequence of clips rather than one
- *  synthesis the user waits through in silence. */
-export function speakLine(text: string): void {
+ *  synthesis the user waits through in silence.
+ *
+ *  IT RETURNS THE OUTCOME. It used to return `void`, which is how a fact the
+ *  process already had went missing: `playClip` knew whether the media element
+ *  reached `ended`, and the answer stopped at this signature. Existing callers
+ *  that ignore the promise are unaffected — nothing about the queueing, the
+ *  splitting or the timing changes, only what the caller is now able to know. */
+export function speakLine(text: string): Promise<SpeakOutcome> {
   const { chunks } = splitSpeakableChunks(text ?? '', true);
-  if (!chunks.length) return;
+  if (!chunks.length) return Promise.resolve('failed');
   queue.push(...chunks);
-  void pump();
+  return new Promise<SpeakOutcome>((resolve) => {
+    // Registered BEFORE pump() so a run already in flight still settles us: our
+    // chunks are in its queue, so it will play them before it finishes.
+    outcomeWaiters.push(resolve);
+    void pump();
+  });
 }
 
 /** Cut playback short and drop anything queued. Used when announcements are

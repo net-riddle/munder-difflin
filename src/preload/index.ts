@@ -1347,6 +1347,22 @@ const api = {
    *  a human). This is the completion signal that does NOT depend on a voice
    *  session, so it fires with no OpenAI involved. Subscribed by the local-voice
    *  announcer. */
+  /** What became of an announcement, reported back by the renderer once the
+   *  audio has actually finished (or not).
+   *
+   *  THREE outcomes, deliberately not two, and `cut-short` is the one that
+   *  matters: the user interrupted, or the clip hit the hard stop, so the
+   *  sentence was NOT heard. Collapsing it into `played` is how a voice tells
+   *  someone they heard a message while they were not listening.
+   *
+   *  Fire-and-forget (`send`, not `invoke`): nobody is waiting on a reply, and
+   *  there is no announcement lifecycle in main to answer with — this reports a
+   *  fact, it does not open a transaction. */
+  taskAnnouncementOutcome: (r: {
+    taskId: string;
+    kind: 'start' | 'done' | 'blocked';
+    outcome: 'played' | 'cut-short' | 'failed';
+  }) => ipcRenderer.send('task:announcement-outcome', r),
   onTaskDone: (
     cb: (evt: { taskId: string; kind: 'start' | 'done' | 'blocked'; who: string; title: string; at: number }) => void
   ): (() => void) => {

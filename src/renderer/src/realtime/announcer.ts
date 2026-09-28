@@ -92,7 +92,23 @@ export function startTaskAnnouncer(): void {
     // still being spoken QUEUES behind it. Interrupting would drop the tail of
     // a sentence mid-word, and the whole point of a local voice is that it is
     // intelligible rather than fast.
-    speakLine(text);
+    //
+    // The outcome is reported, not assumed. The three values are load-bearing:
+    // a `cut-short` announcement was NOT heard — the user interrupted, or the
+    // clip hit the hard stop — and reporting that as `played` would be the exact
+    // false claim this path exists to avoid. A rejection can only mean a waiter
+    // threw, and is deliberately not dressed up as a voice failure.
+    void speakLine(text).then((outcome) => {
+      try {
+        window.cth?.taskAnnouncementOutcome?.({
+          taskId: evt.taskId,
+          kind: evt.kind,
+          outcome
+        });
+      } catch {
+        /* reporting the outcome must never break the announcer */
+      }
+    }, () => { /* see above: not a voice failure */ });
   }) ?? null;
 }
 
