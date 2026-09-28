@@ -92,7 +92,9 @@ the live config, which currently reads `tts-1-hd` / `sober` / speed 1.
 `--check` reports what will not survive being spoken: file paths (both
 separators — a Windows agent writes `src\main\realtime.ts`), URLs, markdown,
 bullets, tables, emoji, commit hashes, `TODO`-style markers, nested parens,
-ellipses, and anything over 600 characters.
+ellipses, and anything over 2000 characters — the ceiling is on the amount of
+speech one message may request, not on what a speaker can say, because a message
+is now cut into pieces of ~220 characters and spoken in sequence.
 
 It reports rather than rewrites, because mechanically stripping markdown leaves
 broken sentences — "the file  is ready" — which are worse than the marker. The

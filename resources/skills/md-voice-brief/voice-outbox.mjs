@@ -49,11 +49,21 @@ import { fileURLToPath } from 'node:url';
 
 /** Hard ceiling on one announcement.
  *
- *  Beyond this the TTS produces a minute of audio nobody asked for: a voice
- *  notification is a sentence or two, and a long one is indistinguishable from a
- *  stuck speaker. The app's own task-title cap is 140; a message is allowed more
- *  room, but not unbounded room. */
-export const MAX_SPOKEN_CHARS = 600;
+ *  This used to be 600, and the reason it was there is gone: the limit existed
+ *  because ONE message produced ONE clip, and a long clip was a minute of audio
+ *  nobody asked for. A message is now cut into pieces of `MAX_PIECE_CHARS` and
+ *  spoken in sequence, so "too long for one clip" is no longer a thing that can
+ *  happen — refusing a 700-character message after building a splitter that
+ *  handles it in four pieces would be refusing work the system can do.
+ *
+ *  The number is now about the AMOUNT OF SPEECH, not about clip size, because
+ *  something still has to bound it: 2000 characters is about nine pieces, roughly
+ *  two and a half minutes. Without a bound, a runaway author could queue a
+ *  message that talks for a quarter of an hour, and a notification nobody asked
+ *  to receive is its own kind of stuck speaker. The message the user sees says
+ *  this, instead of the old wording that implied the length itself was unspeakable.
+ */
+export const MAX_SPOKEN_CHARS = 2000;
 
 /** Above this, warn. Not a failure — some answers genuinely need a sentence more —
  *  but the author should know it is a long announcement before it is sent. */
@@ -158,7 +168,7 @@ export function validateEnvelope(env) {
     problems.push('voice must be a string when present');
   }
   if (typeof env.text === 'string' && env.text.length > MAX_SPOKEN_CHARS) {
-    problems.push(`text is ${env.text.length} characters, over the ${MAX_SPOKEN_CHARS} limit for one spoken message`);
+    problems.push(`text is ${env.text.length} characters, over the ${MAX_SPOKEN_CHARS}-character ceiling on one message (about ${Math.ceil(env.text.length / MAX_PIECE_CHARS)} pieces)`);
   }
   return { ok: problems.length === 0, problems };
 }
@@ -214,7 +224,7 @@ export function checkSpokenText(text) {
   if (/\bTODO\b|\bFIXME\b|\bXXX\b/.test(t)) add('marker', 'contains a TODO/FIXME marker meant for a screen, not an ear');
 
   if (t.length > MAX_SPOKEN_CHARS) {
-    add('too-long', `${t.length} characters, over the ${MAX_SPOKEN_CHARS} limit for one spoken message`);
+    add('too-long', `${t.length} characters, over the ${MAX_SPOKEN_CHARS}-character ceiling on one message — about ${Math.ceil(t.length / MAX_PIECE_CHARS)} pieces, so this is a long briefing rather than an announcement. Cut it, or queue it as several messages`);
   } else if (t.length > WARN_SPOKEN_CHARS) {
     add('long', `${t.length} characters — a long announcement; consider whether one sentence would do`);
   }
@@ -241,9 +251,9 @@ export function normalizeSpoken(text) {
 }
 
 /**
- * Target length of ONE piece, in characters. `MAX_SPOKEN_CHARS` (600) is the hard
- * cap on a whole message and stays where it is; this is a different thing, the
- * length at which a single clip becomes a long unbroken stretch of speech.
+ * Target length of ONE piece, in characters. `MAX_SPOKEN_CHARS` is the ceiling on
+ * the whole message; this is a different thing, the length at which a single clip
+ * becomes a long unbroken stretch of speech.
  *
  * The number is a TARGET, not a limit: a piece is never split mid-word, and a
  * single sentence longer than this is still broken up (see `splitForSpeech`).
@@ -741,6 +751,30 @@ Reads the TTS URL, model, voice and speed from the app's config.json, so a
 message sounds like the voice chosen in Settings → Voice.
 `;
 
+/**
+ * The line the drainer prints for one envelope, and where it goes.
+ *
+ * Extracted because the thing 066 asked for is a WORDING, and a wording that can
+ * only be seen by running the whole drainer with a real speaker is a wording
+ * nobody will change twice. The counts live here so they cannot be left out of
+ * one of the three branches by accident.
+ */
+export function describeFlush(r) {
+  const plural = (k) => `${k} piece${k === 1 ? '' : 's'}`;
+  if (r.ok) {
+    return { stream: 'stdout', text: `spoke ${r.name} (${r.chars} chars, ${plural(r.pieces)})\n` };
+  }
+  if (r.queued) {
+    // Not spoken and not failed. Say so in those words, and still fail the exit
+    // code: the human must never read this as "the message was delivered" when
+    // no audio came out.
+    return { stream: 'stderr', text: `QUEUED NOT SPOKEN ${r.name} (${plural(r.pieces)}, 0 spoken): ${r.error}\n` };
+  }
+  // The counts are the point: "2 of 5 spoken" says how much of the answer the
+  // human actually got, and `r.error` names WHICH piece failed.
+  return { stream: 'stderr', text: `FAILED ${r.name} (${r.spoken} of ${plural(r.pieces)} spoken): ${r.error}\n` };
+}
+
 async function main(argv) {
   const arg = (name) => {
     const i = argv.indexOf(name);
@@ -839,17 +873,9 @@ async function main(argv) {
     let queued = 0;
     for (const n of waiting) {
       const r = await flushOne(outbox, n, { userData, platform: process.platform });
-      if (r.ok) process.stdout.write(`spoke ${r.name} (${r.chars} chars)\n`);
-      else if (r.queued) {
-        // Not spoken and not failed. Say so in those words, and still fail the
-        // exit code: the human must never read this as "the message was
-        // delivered" when no audio came out.
-        queued++;
-        process.stderr.write(`QUEUED NOT SPOKEN ${r.name}: ${r.error}\n`);
-      } else {
-        failed++;
-        process.stderr.write(`FAILED ${r.name}: ${r.error}\n`);
-      }
+      const d = describeFlush(r);
+      if (d.stream === 'stdout') process.stdout.write(d.text);
+      else { process.stderr.write(d.text); if (r.queued) queued++; else failed++; }
     }
     return (failed || queued) ? 1 : 0;
   }

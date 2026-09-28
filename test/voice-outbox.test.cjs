@@ -583,3 +583,91 @@ test('the verifier: the long text really is over the target', () => {
   assert.ok(mod.normalizeSpoken(parts.join(' ')).length > mod.MAX_PIECE_CHARS * 2,
     'the fixture must exceed two targets, or the split is not being exercised');
 });
+
+// ─── 066: what the user is told, and the ceiling that contradicted the split ──
+
+test('a message the splitter can handle is no longer refused for its length', () => {
+  // The contradiction: MAX_SPOKEN_CHARS was 600 while a splitter at 220 exists,
+  // so a 700-character message was rejected for a length the system could
+  // handle in four pieces. Refusing work the system can do is a defect, not a
+  // policy.
+  const sevenHundred = 'Frase parlata di prova. '.repeat(40).slice(0, 700);
+  assert.ok(sevenHundred.length > 700 * 0.9, 'fixture sanity');
+  const r = mod.checkSpokenText(sevenHundred);
+  assert.equal(r.ok, true, `must be accepted now, findings: ${JSON.stringify(r.findings)}`);
+  assert.equal(r.blocking.find((f) => f.code === 'too-long'), undefined, 'no length refusal');
+  const v = mod.validateEnvelope({ v: 1, text: sevenHundred });
+  assert.equal(v.ok, true, `the envelope check must agree: ${JSON.stringify(v.problems)}`);
+
+  // And the checker and the envelope validator must not disagree, which is how
+  // the contradiction would have bitten in production: --check passes, flush refuses.
+  for (const n of [600, 601, 700, 1999, 2000, 2001]) {
+    const text = 'Frase parlata di prova. '.repeat(60).slice(0, n);
+    const byCheck = mod.checkSpokenText(text).ok;
+    const byEnv = mod.validateEnvelope({ v: 1, text }).ok;
+    assert.equal(byCheck, byEnv, `checker and envelope validator disagree at ${n} chars`);
+  }
+});
+
+test('past the ceiling it is still refused, and the reason names the pieces', () => {
+  const huge = 'Frase parlata di prova. '.repeat(200).slice(0, mod.MAX_SPOKEN_CHARS + 50);
+  const r = mod.checkSpokenText(huge);
+  assert.equal(r.ok, false);
+  const p = r.blocking.find((f) => f.code === 'too-long');
+  assert.ok(p, 'expected a length refusal');
+  assert.match(p.detail, /ceiling/, 'the wording must say what kind of limit this is');
+  assert.match(p.detail, /pieces/, 'and how many pieces it would have been');
+  const v = mod.validateEnvelope({ v: 1, text: huge });
+  assert.equal(v.ok, false);
+});
+
+test('the ceiling is about the amount of speech, and the pieces say how much', () => {
+  // Pin the relationship the new wording claims, so the two constants cannot
+  // drift apart silently: the ceiling is a number of PIECES, expressed in chars.
+  const atCeiling = 'Frase parlata di prova. '.repeat(200).slice(0, mod.MAX_SPOKEN_CHARS);
+  const pieces = mod.splitForSpeech(atCeiling).length;
+  assert.ok(pieces <= 12, `the ceiling should be a short briefing, got ${pieces} pieces`);
+  assert.ok(pieces >= 5, `and it should really be several pieces, got ${pieces}`);
+});
+
+test('the flush line says how many pieces, and the failure line names the piece', async () => {
+  // The gap 066 exists for: `spoke` reported success with no count, so "I heard
+  // two of five" was not observable from the outside.
+  const { mkdtempSync, writeFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'vo-066-'));
+  const name = 'msg-3.json';
+  const parts = [];
+  for (let i = 0; i < 6; i++) parts.push(`Frase numero ${i} del messaggio lungo, che occupa un pezzo intero.`);
+  writeFileSync(join(dir, name), JSON.stringify({ v: 1, id: 'msg-3', text: parts.join(' '), createdAt: 'now' }), 'utf8');
+
+  const r = await mod.flushOne(dir, name, { userData: dir, fetchImpl: servesWav(realWav()), platform: 'darwin' });
+  assert.ok(r.pieces > 1, `expected several pieces, got ${r.pieces}`);
+  assert.equal(r.outcome, 'queued');
+  // the fields the CLI line is built from must exist on every branch
+  assert.equal(typeof r.spoken, 'number', 'the report must carry how many were heard');
+  assert.equal(r.spoken, 0, 'nothing was played on a platform with no speaker');
+  assert.equal(typeof r.results.length, 'number');
+  assert.match(r.results[0].queued ? r.error : '', /Windows/, 'the queued reason must survive the piece shape');
+});
+
+test('the printed line itself carries the counts, on every branch', () => {
+  // The requirement was a WORDING, so the wording is what gets pinned. Checking
+  // only that the fields exist is how a line ships that drops one of them.
+  const base = { name: 'm.json', chars: 700, pieces: 3, spoken: 3, results: [] };
+  const ok = mod.describeFlush({ ...base, ok: true });
+  assert.equal(ok.stream, 'stdout');
+  assert.match(ok.text, /^spoke m\.json \(700 chars, 3 pieces\)\n$/, `got ${JSON.stringify(ok.text)}`);
+
+  const one = mod.describeFlush({ ...base, pieces: 1, spoken: 1, ok: true });
+  assert.match(one.text, /1 piece\)/, 'one piece is not "1 pieces"');
+
+  const failed = mod.describeFlush({ ...base, spoken: 2, ok: false, error: 'piece 3/3: TTS request timed out' });
+  assert.equal(failed.stream, 'stderr');
+  assert.match(failed.text, /^FAILED m\.json \(2 of 3 pieces spoken\): piece 3\/3/, `got ${JSON.stringify(failed.text)}`);
+
+  const queued = mod.describeFlush({ ...base, spoken: 0, ok: false, queued: true, error: 'playback is only implemented for Windows' });
+  assert.equal(queued.stream, 'stderr');
+  assert.match(queued.text, /^QUEUED NOT SPOKEN m\.json \(3 pieces, 0 spoken\):/, `got ${JSON.stringify(queued.text)}`);
+});
