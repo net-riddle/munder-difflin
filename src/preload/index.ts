@@ -8,6 +8,8 @@ import type { UpdateStatus } from '../shared/updateState';
 export type { UpdateStatus } from '../shared/updateState';
 import type { ToolStatus } from '../shared/toolCatalog';
 export type { ToolStatus } from '../shared/toolCatalog';
+import type { RealtimeVoiceBackend, TtsFormat } from '../shared/realtimeVoice';
+export type { RealtimeVoiceBackend, TtsFormat } from '../shared/realtimeVoice';
 import type { HeroPayload } from '../shared/heroPayload';
 export type { HeroPayload } from '../shared/heroPayload';
 import type { HookEvent } from '../shared/hookEvents';
@@ -561,6 +563,23 @@ export interface PreservedWorktreeSnapshot {
   baseBranch: string;
   preservedAt: number;
 }
+
+/** Renderer-visible form of a voice action's result: either a phrase to localize
+ *  here, or free text from a layer main does not own.
+ *
+ *  The split is the whole point: main returns a KEY plus variables because it
+ *  cannot localize anything — the chosen language lives in the renderer's
+ *  localStorage. `spoken` stays for text main does not own (an error string from
+ *  the spawner), used verbatim rather than given an invented translation. */
+export type ActionResultView = {
+  ok: boolean;
+  /** What to say, as data. The renderer resolves it in the user's language. */
+  phrase?: { key: string; vars?: Record<string, unknown> };
+  /** Free text, used verbatim when there is no phrase. */
+  spoken?: string;
+  /** true when a destructive op is now PENDING a verbal confirm. */
+  needsConfirm?: boolean;
+};
 
 const api = {
   version: __APP_VERSION__,
@@ -1302,18 +1321,63 @@ const api = {
     | { ok: true; token: string; expiresAt: number | null; sessionConfig: { model: string } }
     | { ok: false; error: string; code?: string }
   > => ipcRenderer.invoke('realtime:mintToken', req ?? {}),
+  // Which VOICE the loop speaks through. Read before connect: the renderer
+  // picks its output modality (OpenAI audio vs text-to-be-synthesized) from
+  // this, so the two processes cannot disagree about who makes the sound.
+  realtimeVoiceSettings: (): Promise<{
+    backend: RealtimeVoiceBackend;
+    tts: { baseUrl: string; model: string; voice: string; speed: number; format: TtsFormat };
+  }> => ipcRenderer.invoke('realtime:voiceSettings'),
+  // The TTS bridge, main-side on purpose: a local OpenAI-compatible server
+  // sends no CORS headers, so this cannot be a renderer fetch. Returns base64
+  // audio + mime. `req.overrides` lets Settings test UNSAVED values.
+  realtimeSpeak: (
+    req: { text: string; model?: string; voice?: string; speed?: number; baseUrl?: string; format?: string }
+  ): Promise<
+    | { ok: true; audio: string; mime: string; bytes: number }
+    | { ok: false; error: string; code?: string }
+  > => ipcRenderer.invoke('realtime:speak', req),
+  /** Settings → "Test voice": synthesizes a fixed line with the given values. */
+  realtimeSpeakTest: (
+    req?: { baseUrl?: string; model?: string; voice?: string; speed?: number; format?: string }
+  ): Promise<{ ok: boolean; error?: string; bytes?: number }> =>
+    ipcRenderer.invoke('realtime:speakTest', req ?? {}),
+/** A task card just changed state (main's taskDoneAnnouncer). `kind` is
+   *  'start' (entered `doing`) or 'done' (reached `done`). This is the
+   *  completion signal that does NOT depend on a voice session, so it fires
+   *  with no OpenAI involved. Subscribed by the local-voice announcer. */
+  onTaskDone: (
+    cb: (evt: { taskId: string; kind: 'start' | 'done'; who: string; title: string; at: number }) => void
+  ): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: Parameters<typeof cb>[0]) => cb(payload);
+    ipcRenderer.on('task:done', listener);
+    return () => ipcRenderer.removeListener('task:done', listener);
+  },
+  /** Write a line to `<userData>/realtime.log` — the only artifact readable
+   *  after a voice failure, since the SDK reports a refused handshake as a
+   *  DOMException that names the wrong layer. Never pass a key. */
+  realtimeLog: (where: string, message?: string): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke('realtime:log', { where, message }),
+  realtimeLogError: (where: string, message: string): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke('realtime:logError', { where, message }),
   // rt-5 voice ACTIONS — the renderer holds NO policy; main (realtimeActions.ts) owns
   // the tiering, two-step verbal confirm, hard allowlist, and michael-voice
-  // attribution. These just forward {verb,...args} and speak back `spoken`.
+  // attribution. These just forward {verb,...args}.
+  //
+  // The result is a PHRASE (a key plus variables) or free `spoken` text, never
+  // a sentence main built: main cannot localize anything, because the chosen
+  // language lives in the renderer's localStorage. The renderer resolves
+  // `phrase` with its own i18next; `spoken` is for text main does not own — an
+  // error string from the spawner, say — and is used verbatim.
   realtimeAction: (
     payload: { verb: string } & Record<string, unknown>
-  ): Promise<{ ok: boolean; spoken: string; needsConfirm?: boolean }> =>
+  ): Promise<ActionResultView> =>
     ipcRenderer.invoke('realtime:action', payload),
   realtimeActionConfirm: (
     req: { phrase: string }
-  ): Promise<{ ok: boolean; spoken: string; needsConfirm?: boolean }> =>
+  ): Promise<ActionResultView> =>
     ipcRenderer.invoke('realtime:action:confirm', req),
-  realtimeActionCancel: (): Promise<{ ok: boolean; spoken: string; needsConfirm?: boolean }> =>
+  realtimeActionCancel: (): Promise<ActionResultView> =>
     ipcRenderer.invoke('realtime:action:cancel'),
   // rt-12 completion seam — a voice-dispatched task finished. `summary` is the
   // human-speakable line Michael relays; the rest is context for a toast/log.

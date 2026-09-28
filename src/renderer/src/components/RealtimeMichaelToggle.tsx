@@ -88,6 +88,7 @@ export interface RealtimeMichaelToggleProps {
 export function RealtimeMichaelToggle({ compact = false }: RealtimeMichaelToggleProps) {
   const { t } = useTranslation();
   const hasOpenAiKey = useStore((s) => s.hasOpenAiKey);
+  const voiceBackend = useStore((s) => s.voiceBackend);
   const { status, error, connect, disconnect } = useRealtimeMichael();
   // Measured viewport coords, not a CSS offset. The agent dock clips its
   // children, so a popover positioned inside the card gets sliced at the card's
@@ -100,18 +101,39 @@ export function RealtimeMichaelToggle({ compact = false }: RealtimeMichaelToggle
   const hintOpen = hint !== null;
 
   const view = STATE_VIEW[status];
-  const noKey = !hasOpenAiKey;
+  const localVoice = voiceBackend === 'local-tts';
 
-  // Without a BYOK OpenAI key: stay visible but disabled (matches FreeFlowButton).
-  // Talk mints an ephemeral token from the OpenAI key (apikey:openai) — the SAME
-  // OpenAI provider key set under Agents & Models, used for the Realtime voice API.
+  // In local mode the loop's `listening` state means something completely
+  // different: nothing is being heard, because no microphone is open. Showing
+  // the live-mic treatment — green pulsing dot, "listening", mic glyph — for a
+  // control that is really an announcer is not cosmetic, it tells the user the
+  // wrong thing about what is happening, which is the one thing an indicator is
+  // for. So the local mode gets its own visual language.
+  const isAnnouncing = localVoice && status === 'listening';
+
+  // The two backends are gated on DIFFERENT things, and getting this wrong makes
+  // the local voice unreachable for exactly the people who chose it. The local
+  // voice opens no session, contacts no model and needs no key — it is a speaker.
+  // Gating it on a BYOK key would leave the button greyed out for the people with
+  // no credits, who are the ones the local voice exists for.
+  const noKey = localVoice ? false : !hasOpenAiKey;
+  // The label follows what the button actually does. "Talk" in local mode would
+  // promise a conversation the backend cannot hold: there is no session, so
+  // nothing listens and nothing answers.
+  const labelKey = isAnnouncing ? 'realtimeToggle.announcing' : view.labelKey;
+  // The icon states what the control does. A microphone promises a conversation
+  // the local backend cannot hold, so the announcer gets a bell instead.
+  const iconName = isAnnouncing || (localVoice && status === 'off') ? 'bell' : 'mic';
+
   // The tooltip carries the full WHY; the quiet info affordance below gives a
   // discoverable cue so the user never just hits a silently-dead button.
   const title = noKey
     ? t('realtimeToggle.noKeyTitle')
     : error
       ? `${t(view.helpKey)} — ${error}`
-      : t(view.helpKey);
+      : localVoice
+        ? t(status === 'off' ? 'realtimeToggle.helpAnnounceOff' : 'realtimeToggle.helpAnnounceOn')
+        : t(view.helpKey);
 
   const onClick = () => {
     if (noKey) return;
@@ -195,7 +217,7 @@ export function RealtimeMichaelToggle({ compact = false }: RealtimeMichaelToggle
       onClick={(e) => e.stopPropagation()}
     >
       <PixelButton
-        variant={view.variant}
+        variant={isAnnouncing ? 'secondary' : view.variant}
         size="sm"
         onClick={onClick}
         disabled={noKey}
@@ -205,22 +227,30 @@ export function RealtimeMichaelToggle({ compact = false }: RealtimeMichaelToggle
         style={!noKey && view.activeBg ? { background: view.activeBg, color: 'var(--cth-ink-900)' } : undefined}
       >
         <span style={{ display: 'inline-flex', gap: 5, alignItems: 'center' }}>
-          {/* Live-state indicator dot — color + animation reflect the loop status. */}
+          {/* Live-state indicator dot — color + animation reflect the loop status.
+              The announcer is ARMED here, not hearing: the live-mic mint pulse
+              would be a lie (nothing is listening), so it gets the lemon idle
+              dot instead, which is the same "on, waiting" signal the connecting
+              state already uses. Speaking still goes sky, so the two states
+              remain distinguishable. */}
           <span
             aria-hidden
             style={{
               width: 6,
               height: 6,
               flexShrink: 0,
-              background: noKey ? 'var(--cth-ink-300)' : view.dot,
+              background: noKey ? 'var(--cth-ink-300)' : (isAnnouncing ? 'var(--cth-lemon)' : view.dot),
               boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)',
-              animation: noKey ? 'none' : view.anim
+              animation: noKey ? 'none' : (isAnnouncing ? 'cth-blink 1400ms steps(2, end) infinite' : view.anim)
             }}
           />
-          <Icon name="mic" />
+          {/* The icon states what the control does. A microphone promises a
+              conversation the local backend cannot hold — it opens no session
+              and listens to nothing — so the announcer gets a bell instead. */}
+          <Icon name={iconName} />
           {!compact && (
             <span style={{ fontFamily: 'var(--cth-font-ui)' }}>
-              {noKey ? t('realtimeToggle.talk') : t(view.labelKey)}
+              {noKey ? t('realtimeToggle.talk') : t(labelKey)}
             </span>
           )}
         </span>

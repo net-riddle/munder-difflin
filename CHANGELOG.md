@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Michael can speak with a voice you host yourself.** Settings → Voice has a Voice engine picker:
+  the shipped OpenAI cloud audio, or a local text-to-speech server. The choice is only about the
+  VOICE — he still listens and thinks on the Realtime API, with the same persona, tools and
+  barge-in, so the OpenAI key is still needed; what changes is that the answer is synthesized on
+  your machine and the spoken words are no longer billed as audio. Any OpenAI-compatible TTS
+  server works (tuned for openedai-speech): point it at the URL, pick a model, voice, speed and
+  format, and press Test voice before saving. Answers are spoken sentence by sentence as Michael
+  produces them, so he starts talking immediately and stops the moment you talk over him.
+- **The interface speaks Italian.** A complete translation of every string — 1193 keys, no
+  fallback to English anywhere — selectable in Settings → General alongside English, Chinese and
+  Arabic.
+- **Michael announces finished work in your language.** With the local voice engine on, he speaks
+  when a task STARTS and when it FINISHES, with no session, no microphone and no API key — the
+  notification keeps working with an exhausted credit balance, which is exactly when you want to
+  be told. The Talk button becomes the one switch for it: no announcement, no speech, no session.
+
+### Fixed
+
+- **A failed voice session no longer hides why.** Pressing Talk could report
+  `Failed to execute 'setRemoteDescription'` — a WebRTC call that was working perfectly, named as
+  the cause of an HTTP refusal that was silently discarded. The refused response's status and
+  message are now surfaced, and the whole handshake is traceable in `realtime.log`.
+- **The voice speaks your language.** Every sentence the orchestrator says — the task
+  announcements, the voice-action replies and confirmations, and the read-tool prose the model
+  repeats back — was an English literal built in the main process, which cannot translate: the
+  chosen language lives in the renderer's localStorage. The main process now returns a message
+  key plus its variables and the renderer resolves it, so the voice follows the app language and a
+  language switch takes effect on the next sentence. Task titles, message bodies and the changelog
+  are deliberately left verbatim — they are somebody's own words.
+
 ## [0.4.6] — 2026-08-27
 
 **The release that speaks your language and updates itself.** The interface runs in Chinese and

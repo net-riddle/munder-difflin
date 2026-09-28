@@ -21,13 +21,30 @@
  * Shape mirrors freeflow/recorder.ts: a single module-level session (only ONE voice
  * loop at a time) exposed through a `useRealtimeMichael()` hook via useSyncExternalStore.
  *
+ * TWO VOICES, ONE BRAIN. The loop above is the same either way — only what comes
+ * back out changes. With the 'openai' backend the session emits audio and this
+ * module plays it through the transport. With 'local-tts' the session emits TEXT
+ * (`outputModalities: ['text']`) and localVoice.ts synthesizes each finished
+ * sentence on the user's own machine through main. STT, the LLM, the tools, the
+ * persona, turn-taking and barge-in are identical, so switching backends changes
+ * the timbre and the bill, never what Michael can do.
+ *
  * Branch feat/realtime-michael. See board.md "🎙 REALTIME MICHAEL".
  */
 import { useSyncExternalStore } from 'react';
 import { RealtimeAgent, RealtimeSession, OpenAIRealtimeWebRTC } from '@openai/agents-realtime';
 import { realtimeReadTools, realtimeSessionSummary } from './tools';
 import { realtimeActionTools } from './actions';
+import { withSdpErrorReporting } from './realtimeSdpError';
 import { resetRealtimeCost, recordRealtimeUsage, endRealtimeCost, isRealtimeIdle, getRealtimeCostSnapshot } from './costStore';
+import {
+  setLocalVoiceOutputDevice,
+  startLocalVoice,
+  stopLocalVoice,
+  onLocalVoiceActivity
+} from './localVoice';
+import { startTaskAnnouncer, stopTaskAnnouncer } from './announcer';
+import type { RealtimeVoiceBackend } from '@shared/realtimeVoice';
 
 /**
  * Voice-loop state machine:
@@ -53,6 +70,10 @@ export interface RealtimeMichaelState {
   deviceId: string | null;
   /** Selected output/speaker device (Oscar's speaker picker, rt-8). null = system default. */
   outputDeviceId: string | null;
+  /** Which voice is speaking: 'openai' (the session's own audio) or 'local-tts'
+   *  (text out, rendered by a TTS server the user runs). Read from main at
+   *  connect, so the renderer never guesses which half of the loop is live. */
+  voiceBackend: RealtimeVoiceBackend;
 }
 
 /** Voices for gpt-realtime-2 (board: Cedar / Marin). god finalizes in rt-6. */
@@ -116,12 +137,14 @@ let state: RealtimeMichaelState = {
   model: null,
   expiresAt: null,
   deviceId: null,
-  outputDeviceId: null
+  outputDeviceId: null,
+  voiceBackend: 'openai'
 };
 const listeners = new Set<() => void>();
 
 /** The single live session (only one voice loop at a time, like freeflow's recorder). */
 let session: RealtimeSession | null = null;
+
 /** The mic stream we opened (so we can stop its tracks on teardown). */
 let stream: MediaStream | null = null;
 /** The <audio> sink for Michael's voice. */
@@ -166,7 +189,9 @@ function setState(patch: Partial<RealtimeMichaelState>): void {
 
 /** Wire the session lifecycle events onto our state machine. */
 function wire(s: RealtimeSession): void {
-  // Model started / stopped speaking audio back to the user.
+  // Model started / stopped speaking audio back to the user. These NEVER fire
+  // in local-tts mode (that session emits text, not audio) — the local voice
+  // queue drives the same two states instead, further down.
   s.on('audio_start', () => {
     if (state.status !== 'working') setState({ status: 'responding' });
   });
@@ -227,6 +252,27 @@ function wire(s: RealtimeSession): void {
   });
 }
 
+/** Mirror the local voice queue's lifecycle into the button's indicator.
+ *
+ *  In local mode there is no session, so no session event will ever report that
+ *  Michael is speaking. This is what makes the dot move at all: the announcer
+ *  speaks with no session open, and the button would otherwise sit on
+ *  "listening" forever while audio plays.
+ *
+ *  Registered once at module load (this loop is a singleton) and guarded on the
+ *  backend, so the OpenAI path — where the session owns the state — is never
+ *  overwritten by the queue's. */
+onLocalVoiceActivity((ev) => {
+  if (state.voiceBackend !== 'local-tts') return;
+  if (ev.type === 'error') { setState({ error: ev.error }); return; }
+  if (ev.type === 'speaking') {
+    // Never from 'working': that is a tool call and has no local-voice session.
+    if (state.status !== 'working') setState({ status: 'responding' });
+    return;
+  }
+  if (ev.type === 'idle' && state.status === 'responding') setState({ status: 'listening' });
+});
+
 /** Stop the mic + release the audio sink. Safe to call repeatedly. */
 function teardownMedia(): void {
   if (stream) {
@@ -248,6 +294,11 @@ function teardownMedia(): void {
     }
   }
   audioEl = null;
+  // A local-voice session keeps its OWN element (the one above is the OpenAI
+  // path's sink), so the queue's sink and any clip mid-playback are released
+  // here too — a disconnect that left audio playing would be a voice nobody
+  // can stop.
+  stopLocalVoice();
 }
 
 /** Make a getUserMedia failure legible. */
@@ -294,20 +345,72 @@ async function applyOutputSink(el: HTMLAudioElement, deviceId: string | null): P
 }
 
 /**
- * Connect the voice loop: mint an ephemeral token, open the mic (EC/NS/AGC), open a
- * WebRTC RealtimeSession with semantic-VAD turn-taking, and start listening.
+ * Start talking.
+ *
+ * TWO DIFFERENT THINGS, chosen by the configured voice backend.
+ *
+ * 'openai' — the full voice loop. Mint an ephemeral token, open the mic
+ * (EC/NS/AGC), open a WebRTC RealtimeSession with semantic-VAD turn-taking, and
+ * have a model listen, think, call tools and answer in audio. This costs money:
+ * the key is required and the balance must not be empty.
+ *
+ * 'local-tts' — NO SESSION AT ALL. Nothing is minted, no microphone is opened,
+ * no model is involved, and OpenAI is never contacted. The button arms the
+ * local TTS queue and returns; from then on a finished task is announced in the
+ * local voice (see announcer.ts) without a conversation, a key, or a credit.
+ *
+ * The two are not variations of one thing. The second cannot hear you and
+ * cannot answer a question, because the part that would do that is the part
+ * that costs money. What it CAN do is speak, locally, whenever the hive has
+ * something to report. Reading it as a degraded voice chat would be a promise
+ * the backend cannot keep.
+ *
  * Idempotent — a no-op if already connecting/connected.
  */
 export async function connect(): Promise<void> {
   if (connecting || (session && state.status !== 'off')) return;
   connecting = true;
   setState({ status: 'connecting', error: null });
+  // Step markers go to <userData>/realtime.log, not just the console: a WebRTC
+  // failure names a DOMException and the console is often closed, so without
+  // this the only way to know whether the mint, the handshake or the session
+  // config failed was to guess. Never logged: the key, the ephemeral token.
+  const trace = (step: string, detail?: string): void => {
+    void window.cth.realtimeLog?.(step, detail).catch(() => { /* logging is best-effort */ });
+  };
+  trace('connect:start');
   try {
+    // Which voice is configured. Read FIRST, because it decides whether a
+    // session is opened at all: asking for a token in local mode would contact
+    // OpenAI for nothing and, with an empty balance, fail the very button whose
+    // whole purpose is to work without OpenAI.
+    let voiceBackend: RealtimeVoiceBackend = 'openai';
+    try {
+      voiceBackend = (await window.cth.realtimeVoiceSettings()).backend;
+    } catch {
+      /* unreachable main ⇒ fall back to the shipped OpenAI voice */
+    }
+    const localVoice = voiceBackend === 'local-tts';
+    setState({ voiceBackend });
+
+    if (localVoice) {
+      // The ONE thing the button does in this mode: switch announcements on.
+      // No mint, no mic, no session, no key — the whole payload of a local
+      // voice is a speaker and a subscription.
+      startLocalVoice(state.outputDeviceId);
+      startTaskAnnouncer();
+      trace('connect:announcements-on');
+      setState({ status: 'listening', muted: false, model: null, expiresAt: null });
+      return;
+    }
+
     const mint = await window.cth.realtimeMintToken();
     if (!mint.ok) {
+      trace('connect:mint-failed', mint.error);
       setState({ status: 'off', error: mint.error });
       return;
     }
+    trace('connect:mint-ok', `model=${mint.sessionConfig.model}`);
 
     // Open the main-process mic gate BEFORE getUserMedia. Oscar's rt-8 permission check
     // is synchronous, so `realtimeVoiceEnabled` must already be true when the mic opens;
@@ -323,8 +426,9 @@ export async function connect(): Promise<void> {
     };
     if (state.deviceId) audioConstraints.deviceId = { exact: state.deviceId };
     stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+    trace('connect:mic-ok');
 
-    // Our own <audio> sink for Michael's voice, routed to the chosen speaker (rt-8).
+    // The <audio> sink for Michael's voice, routed to the chosen speaker (rt-8).
     audioEl = new Audio();
     audioEl.autoplay = true;
     await applyOutputSink(audioEl, state.outputDeviceId);
@@ -357,6 +461,11 @@ export async function connect(): Promise<void> {
       transport,
       model: mint.sessionConfig.model,
       config: {
+        // Audio output, unconditionally. The 'local-tts' backend returns
+        // further up — it never reaches this line, because it opens no session
+        // at all. This was once a two-way branch; the text-modality half is
+        // gone with it, along with the audio.output contradiction that
+        // required textOnlySession.ts to work around.
         outputModalities: ['audio'],
         voice: REALTIME_VOICE,
         audio: {
@@ -376,8 +485,14 @@ export async function connect(): Promise<void> {
     wire(s);
 
     // The ephemeral client secret is the apiKey for this connect; the real OpenAI key
-    // never reaches the renderer.
-    await s.connect({ apiKey: mint.token, model: mint.sessionConfig.model });
+    // never reaches the renderer. Wrapped so a REFUSED handshake reports the API's
+    // own status and message instead of the SDK's "setRemoteDescription" DOMException,
+    // which names the wrong layer entirely — see realtimeSdpError.ts.
+    trace('connect:handshake-start');
+    await withSdpErrorReporting(() =>
+      s.connect({ apiKey: mint.token, model: mint.sessionConfig.model })
+    );
+    trace('connect:handshake-ok');
 
     session = s;
     resetRealtimeCost(Date.now()); // rt-9: start the live session cost meter
@@ -456,7 +571,12 @@ export async function connect(): Promise<void> {
     }
   } catch (e) {
     // Mic permission denied, WebRTC handshake failure, network, etc.
-    console.log('[realtime] voice session disconnect (error)');
+    // Written to <userData>/realtime.log as well as the console: the stack and
+    // the full message are the only record of a failure the user cannot act on
+    // from the UI, and the tooltip truncates to one line.
+    const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    console.error('[realtime] voice session connect failed', e);
+    void window.cth.realtimeLogError?.('connect', detail).catch(() => { /* best-effort */ });
     try {
       session?.close();
     } catch {
@@ -472,11 +592,32 @@ export async function connect(): Promise<void> {
   }
 }
 
-/** Tear down the voice loop and return to `off`. Safe to call when already off.
+/** Tear down and return to `off`. Safe to call when already off.
  *  `reason` (idle | cost-cap | error | user) is logged so an idle auto-off can be
- *  told apart from a spend-cap stop or a user toggle. */
+ *  told apart from a spend-cap stop or a user toggle.
+ *
+ *  In local mode this is the button turning the ANNOUNCER off. There is no
+ *  session, no mic and no model to tear down — and the session-scoped calls
+ *  below (realtimeSetSessionLive, the mic gate) are not merely redundant there,
+ *  they are wrong: they would tell main a voice session just ended, which is
+ *  the flag that decides whether completions are pushed live or queued. */
 export function disconnect(reason: string = 'user'): void {
   console.log(`[realtime] voice session disconnect (${reason})`);
+
+  // The local voice is the whole payload in local mode, and in OpenAI mode it
+  // is dead weight (the queue is unused). Stopping it first means a clip
+  // already playing is cut before anything else is torn down.
+  stopLocalVoice();
+
+  if (state.voiceBackend === 'local-tts') {
+    // The button switched announcements off: drop the subscription, free any
+    // clip mid-sentence, and release the sink. Nothing else to undo, because
+    // nothing else was set up.
+    stopTaskAnnouncer();
+    setState({ status: 'off', muted: false });
+    return;
+  }
+
   try {
     session?.close();
   } catch {
@@ -511,6 +652,9 @@ export function setDeviceId(deviceId: string | null): void {
 export function setOutputDeviceId(deviceId: string | null): void {
   setState({ outputDeviceId: deviceId });
   if (audioEl) void applyOutputSink(audioEl, deviceId);
+  // Local-tts plays through its own element, so the picker has to reach that
+  // one too or the change would appear to do nothing in that mode.
+  setLocalVoiceOutputDevice(deviceId);
 }
 
 function subscribe(cb: () => void): () => void {

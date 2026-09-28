@@ -128,6 +128,12 @@ export function App() {
     window.cth.realtimeHasOpenAiKey().then(has => {
       if (!cancelled) useStore.getState().setHasOpenAiKey(has);
     });
+    // Which voice backend is configured. The Talk button gates differently per
+    // backend — the local voice needs no key, so gating it on one would make it
+    // unreachable for the people who chose it.
+    window.cth.realtimeVoiceSettings().then(v => {
+      if (!cancelled) useStore.getState().setVoiceBackend(v.backend);
+    }).catch(() => { /* keep the default; main is unreachable, the loop will say so */ });
     return () => { cancelled = true; };
   }, []);
 

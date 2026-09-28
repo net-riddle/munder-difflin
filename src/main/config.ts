@@ -22,6 +22,11 @@ import {
   type OrgTriggerConfig,
   type WebhookTrigger
 } from '../shared/triggers';
+import {
+  DEFAULT_LOCAL_TTS,
+  type RealtimeVoiceBackend,
+  type TtsFormat
+} from '../shared/realtimeVoice';
 
 /** A recurring auto-dispatched mission fired on an interval by the scheduler. */
 export interface ScheduledMission {
@@ -365,6 +370,26 @@ export interface HarnessConfig {
    *  auto-disconnect on idle — the spend cap remains the runaway guard. The user
    *  tunes this in Settings → Realtime Michael. */
   realtimeIdleDisconnectMs?: number;
+  /** Which VOICE backend the Realtime Michael loop speaks through. 'openai'
+   *  (default) lets the Realtime session emit its own audio; 'local-tts' keeps
+   *  the same session for STT + LLM + tools but has it emit TEXT, and a
+   *  local OpenAI-compatible TTS server (openedai-speech) renders the audio.
+   *  Only the voice changes — the brain, the tools and the persona are the
+   *  same in both. See src/shared/realtimeVoice.ts. */
+  realtimeVoiceBackend?: RealtimeVoiceBackend;
+  /** OpenAI-compatible root of the local TTS server (openedai-speech, speaches,
+   *  Kokoro-FastAPI, …). Normalized on read: bare host, missing /v1 and
+   *  trailing slashes all resolve to `<scheme>://<host>/v1`. */
+  realtimeTtsBaseUrl?: string;
+  /** TTS model id: 'tts-1' (piper, CPU) or 'tts-1-hd' (XTTS, voice cloning). */
+  realtimeTtsModel?: string;
+  /** TTS voice: alloy | echo | fable | onyx | nova | shimmer, or a custom voice. */
+  realtimeTtsVoice?: string;
+  /** TTS speaking rate, 0.25–4.0 (clamped on read). */
+  realtimeTtsSpeed?: number;
+  /** Audio container returned by the TTS server (mp3 by default — the only
+   *  format every browser sink plays without extra decoding). */
+  realtimeTtsFormat?: TtsFormat;
 
   // ─── Generic inbound webhook + status API (LEGACY, single-endpoint) ─────────
   // Superseded by `webhookTriggers`, which allows many endpoints over one server
@@ -459,6 +484,14 @@ const DEFAULTS: HarnessConfig = {
   freeflowModel: 'whisper-large-v3-turbo',
   realtimeVoiceEnabled: false,
   realtimeIdleDisconnectMs: 180_000,
+  // Voice backend: 'openai' until the user opts into a local TTS server in
+  // Settings → Voice, so an existing install behaves exactly as before.
+  realtimeVoiceBackend: 'openai',
+  realtimeTtsBaseUrl: DEFAULT_LOCAL_TTS.baseUrl,
+  realtimeTtsModel: DEFAULT_LOCAL_TTS.model,
+  realtimeTtsVoice: DEFAULT_LOCAL_TTS.voice,
+  realtimeTtsSpeed: DEFAULT_LOCAL_TTS.speed,
+  realtimeTtsFormat: DEFAULT_LOCAL_TTS.format,
   webhookEnabled: false,
   webhookSecret: undefined,
   webhookPort: undefined,

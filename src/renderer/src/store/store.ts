@@ -16,6 +16,7 @@ import { DEFAULT_ORG_TRIGGER, type OrgTriggerConfig, type WebhookTrigger } from 
 import { isCompactionCommand } from '@shared/providerAutomation';
 import { preferredAgentRole } from '@shared/agentRole';
 import { isInboxNudge } from '@shared/hiveNudge';
+import type { RealtimeVoiceBackend } from '@shared/realtimeVoice';
 import { refocusAfterRemoval, focusOnLoad, restoreFocus } from './focusMode';
 import { chooseRosterSource } from './rosterSource';
 
@@ -276,6 +277,14 @@ interface State {
    *  window.cth.realtimeHasOpenAiKey(). */
   hasOpenAiKey: boolean;
   setHasOpenAiKey: (has: boolean) => void;
+  /** Which voice backend is configured, mirrored from main on load. Read by the
+   *  Talk button because the two backends need DIFFERENT things to be usable:
+   *  'openai' requires a BYOK key, 'local-tts' requires a TTS server and no key
+   *  at all. Gating both on the key would make the local voice unreachable for
+   *  exactly the people using it — those without credits. Set by App via
+   *  window.cth.realtimeVoiceSettings(). */
+  voiceBackend: RealtimeVoiceBackend;
+  setVoiceBackend: (b: RealtimeVoiceBackend) => void;
   /** Mirror of the active office theme (set by App on config load + by Settings
    *  on switch). OfficeFloor depends on this and rebuilds the scene on change. */
   officeTheme: ThemeId;
@@ -880,6 +889,8 @@ export const useStore = create<State>((set, get) => ({
   setHasGroqKey: (has) => set({ hasGroqKey: has }),
   hasOpenAiKey: false,
   setHasOpenAiKey: (has) => set({ hasOpenAiKey: has }),
+  voiceBackend: 'openai',
+  setVoiceBackend: (b) => set({ voiceBackend: b }),
   officeTheme: 'office',
   setOfficeTheme: (theme) => set({ officeTheme: theme }),
   webhookTriggers: [],

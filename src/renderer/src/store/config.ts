@@ -13,6 +13,7 @@ import type {
   WebhookTrigger
 } from '@shared/triggers';
 import { isNewer } from '@shared/updateState';
+import type { RealtimeVoiceBackend, TtsFormat } from '@shared/realtimeVoice';
 import modelCatalog from '@shared/modelCatalog.json';
 
 export {
@@ -108,6 +109,18 @@ export interface HarnessConfig {
   /** Realtime voice idle auto-disconnect (ms); default 180000 (3 min), 0 = never.
    *  Tuned in Settings → Realtime Michael; the cost cap stays the runaway guard. */
   realtimeIdleDisconnectMs?: number;
+  /** Which VOICE speaks (mirrors src/main/config.ts): 'openai' = the Realtime
+   *  session's own audio, 'local-tts' = the session emits text and an
+   *  OpenAI-compatible TTS server the user runs renders it. The brain is the
+   *  same either way. See src/shared/realtimeVoice.ts. */
+  realtimeVoiceBackend?: RealtimeVoiceBackend;
+  /** Local TTS endpoint + voice. Normalized on read in main, so a bare host
+   *  typed in Settings resolves to <scheme>://<host>/v1. */
+  realtimeTtsBaseUrl?: string;
+  realtimeTtsModel?: string;
+  realtimeTtsVoice?: string;
+  realtimeTtsSpeed?: number;
+  realtimeTtsFormat?: TtsFormat;
   costCapUsd?: number;
   /** Hard total-token ceiling across active agents (the user-facing budget). */
   costCapTokens?: number;

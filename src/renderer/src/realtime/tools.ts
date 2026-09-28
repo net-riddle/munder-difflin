@@ -23,32 +23,54 @@
  * lifecycle in session.ts is tool-agnostic, so it survives the swap unchanged.
  */
 import { tool } from '@openai/agents-realtime';
+import i18n from 'i18next';
+import { interpolate, VOICE_PHRASES, type VoiceVars } from '@shared/voicePhrases';
 
 // ─── spoken-prose formatting helpers ────────────────────────────────────────
+//
+// Everything in this file is eventually READ ALOUD: these strings are tool
+// results, the model repeats them, and the voice speaks them. So the sentences
+// are localized through the `rt.*` keyspace (see the `rt` block in the locale
+// files) rather than written inline — the same reason the action layer returns
+// a phrase key instead of prose.
+//
+// Two things are deliberately NOT localized, and the line between them matters:
+//   - the DATA half of a result (the JSON payload appended to a summary) — that
+//     is machine-readable context for the model, not something to pronounce;
+//   - a card title or a message body, which is text an agent or a person wrote.
+//     Translating those puts words in someone's mouth.
+// The number formatting below is shared by both, and it is language-neutral
+// except for the magnitude words, which are keys.
+
+const t = (key: string, vars?: Record<string, unknown>): string =>
+  interpolate(
+    (i18n.t(`rt.${key}`) as unknown as string) || VOICE_PHRASES[`rt.${key}`] || key,
+    (vars ?? {}) as VoiceVars
+  );
 
 /** Relative "x ago" for a unix-ms timestamp; voice-safe and defensive. */
 function ago(ts: unknown): string {
-  if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return 'an unknown time ago';
+  if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return t('ago.unknown');
   const ms = Date.now() - ts;
-  if (ms < 5_000) return 'just now';
+  if (ms < 5_000) return t('ago.now');
   const s = Math.round(ms / 1000);
-  if (s < 60) return `${s} seconds ago`;
+  if (s < 60) return t('ago.seconds', { count: s });
   const m = Math.round(s / 60);
-  if (m < 60) return `${m} minute${m === 1 ? '' : 's'} ago`;
+  if (m < 60) return t('ago.minutes', { count: m });
   const h = Math.round(m / 60);
-  if (h < 24) return `${h} hour${h === 1 ? '' : 's'} ago`;
+  if (h < 24) return t('ago.hours', { count: h });
   const d = Math.round(h / 24);
-  return `${d} day${d === 1 ? '' : 's'} ago`;
+  return t('ago.days', { count: d });
 }
 
 /** Humanize an interval in ms into spoken cadence ("every 5 minutes"). */
 function every(ms: unknown): string {
-  if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return 'on an unknown cadence';
+  if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return t('cadence.unknown');
   const m = Math.round(ms / 60_000);
-  if (m < 1) return 'every minute or less';
-  if (m < 60) return `every ${m} minute${m === 1 ? '' : 's'}`;
+  if (m < 1) return t('cadence.under_minute');
+  if (m < 60) return t('cadence.minutes', { count: m });
   const h = Math.round(m / 60);
-  return `every ${h} hour${h === 1 ? '' : 's'}`;
+  return t('cadence.hours', { count: h });
 }
 
 function plural(n: number, one: string, many = one + 's'): string {
@@ -58,8 +80,8 @@ function plural(n: number, one: string, many = one + 's'): string {
 /** Compact a big number for speech (1.2 thousand / 3.4 million). */
 function tokens(n: unknown): string {
   const v = typeof n === 'number' && isFinite(n) ? n : 0;
-  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)} million`;
-  if (v >= 1_000) return `${(v / 1_000).toFixed(1)} thousand`;
+  if (v >= 1_000_000) return t('num.million', { value: (v / 1_000_000).toFixed(1) });
+  if (v >= 1_000) return t('num.thousand', { value: (v / 1_000).toFixed(1) });
   return `${Math.round(v)}`;
 }
 
@@ -96,10 +118,10 @@ const str = (x: unknown): string => (typeof x === 'string' ? x : '');
 async function spoken(fn: () => Promise<string>, what: string): Promise<string> {
   try {
     const out = (await fn()).trim();
-    return out || `I could not find any ${what} right now.`;
+    return out || t('tool.none_found', { what });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : 'an unknown error';
-    return `I could not read the ${what} just now (${msg}).`;
+    const msg = e instanceof Error ? e.message : t('ago.unknown');
+    return t('tool.read_failed', { what, reason: msg });
   }
 }
 
@@ -121,7 +143,7 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
         spoken(async () => {
           const reg = await window.cth.hiveRegistry();
           const entries = Object.entries(obj(reg.agents));
-          if (!entries.length) return 'The hive has no registered agents yet.';
+          if (!entries.length) return t('tool.no_agents');
           const active = entries.filter(([, a]) => !obj(a).archived);
           const archived = entries.length - active.length;
           const godId = reg.godId;
@@ -130,19 +152,20 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
             .filter(([id]) => id !== godId)
             .map(([, a]) => {
               const m = obj(a);
-              const name = str(m.name) || 'an unnamed agent';
+              const name = str(m.name) || t('tool.unnamed_agent');
               const role = str(m.role);
               const provider = str(m.provider) || 'claude';
-              const status = str(m.status) || 'unknown';
-              return `${name}${role ? `, the ${role},` : ''} on ${provider} (${status})`;
+              const status = str(m.status) || t('tool.unknown');
+              return t('tool.roster_line', { name, role, provider, status });
             });
-          const head = `There ${active.length === 1 ? 'is' : 'are'} ${plural(active.length, 'agent')} active${
-            archived ? ` and ${plural(archived, 'archived agent')}` : ''
-          }.`;
-          const god = godName ? ` ${godName} is the god orchestrator.` : '';
-          const roster = lines.length ? ` Active workers: ${lines.join('; ')}.` : '';
+          const head = t('tool.fleet_head', {
+            count: active.length,
+            archived: archived ? t('tool.archived_agents', { count: archived }) : ''
+          });
+          const god = godName ? ` ${t('tool.is_god', { god: godName })}` : '';
+          const roster = lines.length ? ` ${t('tool.active_workers', { list: lines.join('; ') })}` : '';
           return head + god + roster;
-        }, 'fleet status')
+        }, t('tool.what_fleet'))
     }),
 
     // ── get_tasks ─────────────────────────────────────────────────────────
@@ -168,34 +191,34 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
           const filter = typeof a.status === 'string' ? a.status : null;
           const raw = await window.cth.hiveTasks();
           const list = Array.isArray(obj(raw).tasks) ? (obj(raw).tasks as unknown[]) : [];
-          if (!list.length) return 'The task board is empty.';
+          if (!list.length) return t('tool.board_empty');
           const tasks = list.map(obj);
-          const by = (s: string): Record<string, unknown>[] => tasks.filter((t) => str(t.status) === s);
-          const counts = `${plural(by('todo').length, 'to do')}, ${by('doing').length} in progress, ${plural(
-            by('blocked').length,
-            'blocked'
-          )}, and ${by('done').length} done`;
-          const describe = (t: Record<string, unknown>): string => {
-            const who = str(t.assignee);
-            return `"${clip(str(t.title) || str(t.id) || 'untitled', 90)}"${who ? ` (${who})` : ''}`;
+          const by = (s: string): Record<string, unknown>[] => tasks.filter((c) => str(c.status) === s);
+          const counts = t('tool.counts', {
+            todo: by('todo').length,
+            doing: by('doing').length,
+            blocked: by('blocked').length,
+            done: by('done').length
+          });
+          const describe = (c: Record<string, unknown>): string => {
+            const who = str(c.assignee);
+            return `"${clip(str(c.title) || str(c.id) || t('tool.untitled'), 90)}"${who ? ` (${who})` : ''}`;
           };
           if (filter) {
             const sel = by(filter);
-            if (!sel.length) return `Nothing is ${filter} right now. Overall: ${counts}.`;
-            return `${plural(sel.length, 'task')} ${filter}: ${sel.slice(0, 12).map(describe).join('; ')}.`;
+            if (!sel.length) return t('tool.nothing_that_status', { filter, counts });
+            return t('tool.filtered_tasks', { count: sel.length, filter, list: sel.slice(0, 12).map(describe).join('; ') });
           }
           const doing = by('doing');
           const blocked = by('blocked');
           const detail = [
-            doing.length ? `In progress: ${doing.slice(0, 8).map(describe).join('; ')}.` : '',
-            blocked.length ? `Blocked: ${blocked.slice(0, 8).map(describe).join('; ')}.` : ''
+            doing.length ? t('tool.doing_detail', { list: doing.slice(0, 8).map(describe).join('; ') }) : '',
+            blocked.length ? t('tool.blocked_detail', { list: blocked.slice(0, 8).map(describe).join('; ') }) : ''
           ]
             .filter(Boolean)
             .join(' ');
-          return `There ${tasks.length === 1 ? 'is' : 'are'} ${plural(tasks.length, 'task')}: ${counts}.${
-            detail ? ' ' + detail : ''
-          }`;
-        }, 'task board')
+          return t('tool.board_summary', { count: tasks.length, counts, detail });
+        }, t('tool.what_board'))
     }),
 
     // ── get_cost ──────────────────────────────────────────────────────────
@@ -208,7 +231,7 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
         spoken(async () => {
           const snap = await window.cth.telemetrySnapshot();
           const usage = Array.isArray(snap.usage) ? snap.usage : [];
-          if (!usage.length) return 'No token usage has been recorded this session yet.';
+          if (!usage.length) return t('tool.no_usage');
           let totIn = 0;
           let totOut = 0;
           const perAgent = new Map<string, number>();
@@ -218,18 +241,20 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
             const outTok = typeof m.output === 'number' ? m.output : 0;
             totIn += inTok;
             totOut += outTok;
-            const id = str(m.agentId) || 'unknown';
+            const id = str(m.agentId) || t('tool.unknown');
             perAgent.set(id, (perAgent.get(id) ?? 0) + inTok + outTok);
           }
           const top = [...perAgent.entries()]
             .sort((x, y) => y[1] - x[1])
             .slice(0, 3)
-            .map(([id, tok]) => `${id} at ${tokens(tok)} tokens`);
-          return `So far this session the hive has used ${tokens(totIn)} input and ${tokens(totOut)} output tokens across ${plural(
-            perAgent.size,
-            'agent'
-          )}.${top.length ? ` Top users: ${top.join(', ')}.` : ''}`;
-        }, 'token usage')
+            .map(([id, tok]) => t('tool.top_user', { who: id, tokens: tokens(tok) }));
+          return t('tool.cost_summary', {
+            input: tokens(totIn),
+            output: tokens(totOut),
+            agents: perAgent.size,
+            top: top.length ? t('tool.top_users', { list: top.join(', ') }) : ''
+          });
+        }, t('tool.what_usage'))
     }),
 
     // ── get_triggers ──────────────────────────────────────────────────────
@@ -242,21 +267,18 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
         spoken(async () => {
           const missions = await window.cth.listMissions();
           const list = Array.isArray(missions) ? missions : [];
-          if (!list.length) return 'There are no scheduled missions configured.';
+          if (!list.length) return t('tool.no_schedules');
           const enabled = list.filter((m) => obj(m).enabled);
-          if (!enabled.length) return `There are ${plural(list.length, 'scheduled mission')}, but all are disabled.`;
+          if (!enabled.length) return t('tool.schedules_all_disabled', { count: list.length });
           const lines = enabled.slice(0, 8).map((m) => {
             const o = obj(m);
-            const label = str(o.label) || 'a mission';
+            const label = str(o.label) || t('tool.a_mission');
             const to = str(o.to);
-            const last = o.lastFiredAt ? `, last fired ${ago(o.lastFiredAt)}` : ', not fired yet';
-            return `${label} ${every(o.intervalMs)}${to ? ` to ${to}` : ''}${last}`;
+            const last = o.lastFiredAt ? t('tool.last_fired', { when: ago(o.lastFiredAt) }) : t('tool.not_fired');
+            return `${label} ${every(o.intervalMs)}${to ? t('tool.to', { who: to }) : ''}${last}`;
           });
-          return `There ${enabled.length === 1 ? 'is' : 'are'} ${plural(
-            enabled.length,
-            'active scheduled mission'
-          )}: ${lines.join('; ')}.`;
-        }, 'schedules')
+          return t('tool.active_schedules', { count: enabled.length, list: lines.join('; ') });
+        }, t('tool.what_schedules'))
     }),
 
     // ── get_config ────────────────────────────────────────────────────────
@@ -335,8 +357,8 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
               if (!bySource.has(who)) bySource.set(who, []);
               bySource.get(who)!.push(r.excerpt);
             }
-            const lines = [...bySource.entries()].slice(0, 6).map(([who, ex]) => `${who} noted ${ex.slice(0, 2).join('; ')}`);
-            return `From the team's notes — ${lines.join('. ')}.`;
+            const lines = [...bySource.entries()].slice(0, 6).map(([who, ex]) => t('tool.noted', { who, what: ex.slice(0, 2).join('; ') }));
+            return t('tool.team_notes', { list: lines.join('. ') });
           };
 
           // query + agentId → search WITHIN one agent (semantic wing first, then text).
@@ -348,10 +370,10 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
             const mem = await window.cth.hiveMemory(agentId);
             const ql = query.toLowerCase();
             const matched = mem.split('\n').map((l) => l.trim()).filter((l) => l.toLowerCase().includes(ql)).slice(0, 8);
-            if (matched.length) return clip(`From ${agentId}'s memory — ${matched.join(' ')}`, 1600);
+            if (matched.length) return clip(t('tool.from_agent_memory', { who: agentId, what: matched.join(' ') }), 1600);
             return mem.trim()
-              ? `I read ${agentId}'s memory but found nothing about "${query}".`
-              : `${agentId} has not recorded any memory yet.`;
+              ? t('tool.nothing_about', { who: agentId, query })
+              : t('tool.no_memory_yet', { who: agentId });
           }
 
           // query alone → semantic across the whole palace, then text fallback across all agents.
@@ -360,23 +382,23 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
             if (res.ok && res.output.trim()) return clip(res.output.trim(), 1600);
             const tf = await textFallback(query);
             if (tf) return clip(tf, 1600);
-            return `I searched the team's memory but found nothing about "${query}".`;
+            return t('tool.searched_nothing', { query });
           }
 
           // agentId alone → read that agent's notes directly (any agent, active OR archived).
           if (agentId) {
             const mem = await window.cth.hiveMemory(agentId);
-            return mem.trim() ? clip(mem.trim(), 1600) : `${agentId} has not recorded any memory yet.`;
+            return mem.trim() ? clip(mem.trim(), 1600) : t('tool.no_memory_yet', { who: agentId });
           }
 
           // neither → status, but make clear search always works.
           const status = await window.cth.memoryStatus();
           const sem = status.active
-            ? 'Semantic memory is active'
+            ? t('tool.mem_active')
             : status.available
-            ? 'Semantic memory is enabled but idle'
-            : 'Semantic memory is offline';
-          return `${sem} — but I can always text-search every agent's notes, active or archived. Ask me to search a topic, or name an agent to read their memory.`;
+            ? t('tool.mem_idle')
+            : t('tool.mem_offline');
+          return `${sem}${t('tool.mem_always_search')}`;
         }, 'memory')
     }),
 
@@ -399,19 +421,19 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
           const want = typeof a.limit === 'number' && isFinite(a.limit) ? Math.max(1, Math.min(40, Math.round(a.limit))) : 12;
           const log = await window.cth.hiveLog(want);
           const list = Array.isArray(log) ? log : [];
-          if (!list.length) return 'There is no recorded hive activity yet.';
+          if (!list.length) return t('tool.no_activity');
           const lines = list
             .slice(-want)
             .reverse()
             .map((e) => {
               const o = obj(e);
-              const kind = str(o.kind) || str(o.event) || 'event';
+              const kind = str(o.kind) || str(o.event) || t('tool.event');
               const who = str(o.agentId) || str(o.name) || str(o.from);
               const when = ago(o.ts);
-              return `${kind}${who ? ` by ${who}` : ''} ${when}`;
+              return `${kind}${who ? t('tool.by', { who }) : ''} ${when}`;
             });
-          return `Most recent activity: ${lines.join('; ')}.`;
-        }, 'activity log')
+          return t('tool.most_recent_activity', { list: lines.join('; ') });
+        }, t('tool.what_activity'))
     }),
 
     // ── get_messages ──────────────────────────────────────────────────────
@@ -437,27 +459,37 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
           const limit = typeof a.limit === 'number' && isFinite(a.limit) ? Math.max(1, Math.min(40, Math.round(a.limit))) : 8;
 
           // Speak one message's body relative to a perspective. from→to + subject + body.
+          // The SUBJECT and BODY are somebody's words — never translated, only
+          // the frame around them is.
           const speakOne = (m: { from: string; to: string; subject: string; body: string; created_at: string; requires_reply: boolean }, full: boolean): string => {
             const subj = str(m.subject).trim();
             const body = despan(str(m.body)).trim();
-            const head = `${str(m.from) || 'someone'} to ${str(m.to) || 'someone'}${subj ? ` about "${clip(subj, 80)}"` : ''} ${ago(Date.parse(m.created_at))}`;
-            if (!body) return `${head}, with no body.`;
-            return `${head}: ${clip(body, full ? 700 : 220)}${m.requires_reply ? ' (a reply was requested)' : ''}`;
+            const head = t('tool.msg_head', {
+              from: str(m.from) || t('tool.someone'),
+              to: str(m.to) || t('tool.someone'),
+              subject: subj ? t('tool.msg_about', { subject: clip(subj, 80) }) : '',
+              when: ago(Date.parse(m.created_at))
+            });
+            if (!body) return t('tool.msg_no_body', { head });
+            return `${head}: ${clip(body, full ? 700 : 220)}${m.requires_reply ? t('tool.msg_reply_wanted') : ''}`;
           };
 
           if (messageId) {
             const found = await window.cth.hiveMessages({ id: messageId });
-            if (!found.length) return `I couldn't find a message with id ${messageId}.`;
-            return `That message — ${speakOne(found[0], true)}.`;
+            if (!found.length) return t('tool.no_message_id', { id: messageId });
+            return t('tool.that_message', { what: speakOne(found[0], true) });
           }
 
           const msgs = await window.cth.hiveMessages(agentId ? { agentId, limit } : { limit });
-          if (!msgs.length)
-            return agentId ? `I don't see any messages in ${agentId}'s mailbox.` : 'There are no hive messages to read yet.';
-          const scope = agentId ? `${agentId}'s mailbox` : 'the floor';
+          if (!msgs.length) {
+            return agentId
+              ? t('tool.mailbox_empty', { who: agentId })
+              : t('tool.no_messages_yet');
+          }
+          const scope = agentId ? t('tool.scope_agent', { who: agentId }) : t('tool.scope_floor');
           const lines = msgs.slice(0, limit).map((m) => speakOne(m, false));
-          return `${plural(lines.length, 'recent message')} from ${scope}: ${lines.join('. ')}.`;
-        }, 'messages')
+          return t('tool.recent_messages', { count: lines.length, scope, list: lines.join('. ') });
+        }, t('tool.what_messages'))
     }),
 
     // ── get_agent_detail ──────────────────────────────────────────────────
@@ -477,14 +509,14 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
         spoken(async () => {
           const a = obj(input);
           const want = str(a.agentId).trim().toLowerCase();
-          if (!want) return 'Tell me which agent you mean.';
+          if (!want) return t('tool.which_agent');
           const dir = await window.cth.hiveAgentDirectory();
           const list = Array.isArray(dir.agents) ? dir.agents : [];
           const e =
             list.find((x) => x.id.toLowerCase() === want) ??
             list.find((x) => x.name.toLowerCase() === want) ??
             list.find((x) => x.id.toLowerCase().startsWith(want) || x.name.toLowerCase().startsWith(want));
-          if (!e) return `I don't see an agent matching "${str(a.agentId)}".`;
+          if (!e) return t('tool.no_agent_match', { ref: str(a.agentId) });
           const parts: string[] = [];
           const role = e.role ? `, the ${e.role},` : '';
           const where = e.archived
@@ -525,7 +557,7 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
           const includeArchived = a.includeArchived !== false;
           const dir = await window.cth.hiveAgentDirectory();
           const all = Array.isArray(dir.agents) ? dir.agents : [];
-          if (!all.length) return 'The hive has no registered agents.';
+          if (!all.length) return t('tool.no_agents');
           const active = all.filter((e) => !e.archived);
           const archived = all.filter((e) => e.archived);
           const near = active
@@ -562,7 +594,7 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
         spoken(async () => {
           const board = await window.cth.hiveBoard();
           const text = despan(board || '');
-          if (!text) return 'The board is empty right now.';
+          if (!text) return t('tool.board_empty_now');
           return clip(text, 1800);
         }, 'board')
     }),
@@ -608,8 +640,12 @@ export function realtimeReadTools(): ReturnType<typeof tool>[] {
         spoken(async () => {
           const info = await window.cth.appInfo();
           const notes = despan(info.changelog || '');
-          return `This is Munder Difflin version ${info.version}. ${notes ? `Latest release notes: ${clip(notes, 1600)}` : 'No release notes are bundled with this build.'}`;
-        }, 'app info')
+          // The release notes themselves are ENGLISH on purpose: they are a
+          // verbatim document shipped with the build, and translating a
+          // changelog would mean shipping a second, drifting one.
+          return t('tool.app_version', { version: info.version }) + ' ' +
+            (notes ? t('tool.release_notes', { notes: clip(notes, 1600) }) : t('tool.no_notes'));
+        }, t('tool.what_app'))
     })
   ];
 }

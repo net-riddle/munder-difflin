@@ -1,6 +1,17 @@
 import { useState, useEffect, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AGENT_MODELS, type HarnessConfig } from '@/store/config';
+import {
+  DEFAULT_LOCAL_TTS,
+  TTS_FORMATS,
+  TTS_MODELS,
+  clampTtsSpeed,
+  normalizeTtsBaseUrl,
+  normalizeTtsFormat,
+  normalizeVoiceBackend,
+  type RealtimeVoiceBackend,
+  type TtsFormat
+} from '@shared/realtimeVoice';
 import { useStore } from '@/store/store';
 import {
   CLONE_NODE_BLURB,
@@ -355,6 +366,11 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
         ...budgetPatch(),
         ...pending
       };
+      // The voice engine is NOT staged per-control (it is a cluster of fields,
+      // like the breaker block): one resolved patch, written with everything
+      // else, so a half-saved TTS config — a new URL with the old voice — is
+      // not a state the app can reach.
+      Object.assign(patch, voiceEnginePatch());
       if (autoCompactPending !== null) {
         // Read-modify-write against disk, not against a stale copy: another
         // window (or main) may have edited a different mission meanwhile.
@@ -535,6 +551,71 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
     (config as HarnessConfig).realtimeIdleDisconnectMs ?? 180_000
   );
 
+  // ─── Which VOICE speaks: OpenAI's own audio, or a local TTS server ──────────
+  // The only thing these change is who renders the answer. The OpenAI key is
+  // still required either way (it drives the BRAIN — STT, LLM, tools), so this
+  // block never removes the key field above; it changes what the key is FOR.
+  const [voiceBackend, setVoiceBackend] = useState<RealtimeVoiceBackend>(
+    normalizeVoiceBackend((config as HarnessConfig).realtimeVoiceBackend)
+  );
+  const [ttsBaseUrl, setTtsBaseUrl] = useState(
+    (config as HarnessConfig).realtimeTtsBaseUrl ?? DEFAULT_LOCAL_TTS.baseUrl
+  );
+  const [ttsModel, setTtsModel] = useState(
+    (config as HarnessConfig).realtimeTtsModel ?? DEFAULT_LOCAL_TTS.model
+  );
+  const [ttsVoice, setTtsVoice] = useState(
+    (config as HarnessConfig).realtimeTtsVoice ?? DEFAULT_LOCAL_TTS.voice
+  );
+  const [ttsSpeed, setTtsSpeed] = useState(
+    String((config as HarnessConfig).realtimeTtsSpeed ?? DEFAULT_LOCAL_TTS.speed)
+  );
+  const [ttsFormat, setTtsFormat] = useState<TtsFormat>(
+    normalizeTtsFormat((config as HarnessConfig).realtimeTtsFormat)
+  );
+  const [ttsBusy, setTtsBusy] = useState(false);
+  const [ttsNote, setTtsNote] = useState('');
+  /** Snapshot of the last successful test, so Settings can show what is
+   *  actually listening rather than only that the last attempt passed. */
+  const [ttsOk, setTtsOk] = useState<boolean | null>(null);
+
+  /** Test the TTS server with the values on screen — not the saved ones. Saving
+   *  a config and then discovering piper is not running wastes a round trip
+   *  through the whole voice loop to learn it. */
+  const testLocalVoice = async (): Promise<void> => {
+    setTtsBusy(true);
+    setTtsNote('');
+    try {
+      const r = await window.cth.realtimeSpeakTest({
+        baseUrl: ttsBaseUrl.trim(),
+        model: ttsModel,
+        voice: ttsVoice.trim(),
+        speed: Number(ttsSpeed),
+        format: ttsFormat
+      });
+      setTtsOk(r.ok);
+      setTtsNote(r.ok
+        ? t('settings.voice.localTestOk', { bytes: r.bytes ?? 0 })
+        : (r.error ?? t('settings.voice.localTestFail')));
+    } catch (e) {
+      setTtsOk(false);
+      setTtsNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTtsBusy(false);
+    }
+  };
+
+  /** The staged config patch for the voice engine. Written on Save like the
+   *  idle window above, so the "unsaved changes" guard covers it. */
+  const voiceEnginePatch = (): Partial<HarnessConfig> => ({
+    realtimeVoiceBackend: voiceBackend,
+    realtimeTtsBaseUrl: normalizeTtsBaseUrl(ttsBaseUrl) || ttsBaseUrl.trim(),
+    realtimeTtsModel: ttsModel,
+    realtimeTtsVoice: ttsVoice.trim() || DEFAULT_LOCAL_TTS.voice,
+    realtimeTtsSpeed: clampTtsSpeed(ttsSpeed),
+    realtimeTtsFormat: ttsFormat
+  }) as Partial<HarnessConfig>;
+
   // Re-seed every editable field from the on-disk config when the modal opens.
   // App's `config` prop is loaded once and never refreshed after a save, so
   // without this the saved budget / velocity / slack values show blank on reopen.
@@ -558,6 +639,12 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
       setGroqKey(cc.groqApiKey ?? '');
       setFreeflowModel(cc.freeflowModel ?? 'whisper-large-v3-turbo');
       setIdleDisconnectMs((c as HarnessConfig).realtimeIdleDisconnectMs ?? 180_000);
+      setVoiceBackend(normalizeVoiceBackend((c as HarnessConfig).realtimeVoiceBackend));
+      setTtsBaseUrl((c as HarnessConfig).realtimeTtsBaseUrl ?? DEFAULT_LOCAL_TTS.baseUrl);
+      setTtsModel((c as HarnessConfig).realtimeTtsModel ?? DEFAULT_LOCAL_TTS.model);
+      setTtsVoice((c as HarnessConfig).realtimeTtsVoice ?? DEFAULT_LOCAL_TTS.voice);
+      setTtsSpeed(String((c as HarnessConfig).realtimeTtsSpeed ?? DEFAULT_LOCAL_TTS.speed));
+      setTtsFormat(normalizeTtsFormat((c as HarnessConfig).realtimeTtsFormat));
     }).catch(() => { /* keep prop-seeded values */ });
     window.cth.kgStatus().then((s) => { if (alive) setKgDocCount(s.docCount); })
       .catch(() => { /* status unavailable */ });
@@ -1984,6 +2071,131 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
                           </span>
                         </div>
 
+                        {/* Voice engine — WHICH voice speaks. Deliberately placed
+                            ABOVE the key field: choosing a local voice still needs
+                            the OpenAI key (it runs the brain), so a user who lands
+                            here and switches backends must still read what the key
+                            is now for, not find it buried under a form. */}
+                        <div style={{
+                          display: 'flex', flexDirection: 'column', gap: 8,
+                          padding: 10,
+                          background: 'var(--cth-paper-100)',
+                          boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)'
+                        }}>
+                          <span style={sectionHeadFlush}>
+                            {t('settings.voice.engine')}
+                          </span>
+                          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                            <PixelButton
+                              variant={voiceBackend === 'openai' ? 'primary' : 'secondary'}
+                              size="sm"
+                              onClick={() => { setVoiceBackend('openai'); setTtsOk(null); setTtsNote(''); }}
+                            >
+                              {t('settings.voice.engineOpenai')}
+                            </PixelButton>
+                            <PixelButton
+                              variant={voiceBackend === 'local-tts' ? 'primary' : 'secondary'}
+                              size="sm"
+                              onClick={() => { setVoiceBackend('local-tts'); setTtsOk(null); setTtsNote(''); }}
+                            >
+                              {t('settings.voice.engineLocal')}
+                            </PixelButton>
+                          </div>
+                          <span style={{ fontSize: 12, lineHeight: '17px', color: 'var(--cth-ink-700)' }}>
+                            {voiceBackend === 'openai'
+                              ? t('settings.voice.engineDescOpenai', { model: REALTIME_MODEL })
+                              : t('settings.voice.engineDescLocal')}
+                          </span>
+
+                          {voiceBackend === 'local-tts' && (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                              <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                <span style={slackLabelStyle}>{t('settings.voice.localUrl')}</span>
+                                <input
+                                  value={ttsBaseUrl}
+                                  onChange={(e) => setTtsBaseUrl(e.target.value)}
+                                  placeholder={DEFAULT_LOCAL_TTS.baseUrl}
+                                  style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                />
+                              </label>
+
+                              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 150 }}>
+                                  <span style={slackLabelStyle}>{t('settings.voice.localModel')}</span>
+                                  <select
+                                    value={ttsModel}
+                                    onChange={(e) => setTtsModel(e.target.value)}
+                                    style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                  >
+                                    {TTS_MODELS.map((m) => (
+                                      <option key={m} value={m}>{m}</option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 130 }}>
+                                  <span style={slackLabelStyle}>{t('settings.voice.localFormat')}</span>
+                                  <select
+                                    value={ttsFormat}
+                                    onChange={(e) => setTtsFormat(e.target.value as TtsFormat)}
+                                    style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                  >
+                                    {TTS_FORMATS.map((f) => (
+                                      <option key={f} value={f}>{f}</option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 150 }}>
+                                  <span style={slackLabelStyle}>{t('settings.voice.localSpeed')}</span>
+                                  <select
+                                    value={ttsSpeed}
+                                    onChange={(e) => setTtsSpeed(e.target.value)}
+                                    style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                  >
+                                    <option value="0.75">0.75×</option>
+                                    <option value="1">1.0×</option>
+                                    <option value="1.25">1.25×</option>
+                                    <option value="1.5">1.5×</option>
+                                    <option value="2">2.0×</option>
+                                  </select>
+                                </label>
+                              </div>
+
+                              <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                <span style={slackLabelStyle}>{t('settings.voice.localVoiceName')}</span>
+                                <input
+                                  value={ttsVoice}
+                                  onChange={(e) => setTtsVoice(e.target.value)}
+                                  placeholder={DEFAULT_LOCAL_TTS.voice}
+                                  style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                />
+                              </label>
+
+                              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                <PixelButton
+                                  variant="secondary"
+                                  size="sm"
+                                  onClick={() => void testLocalVoice()}
+                                  disabled={ttsBusy}
+                                >
+                                  {ttsBusy ? t('settings.voice.localTesting') : t('settings.voice.localTest')}
+                                </PixelButton>
+                                {ttsNote && (
+                                  <span style={{
+                                    fontSize: 12, lineHeight: '16px',
+                                    color: ttsOk ? 'var(--cth-ink-900)' : 'var(--cth-coral)'
+                                  }}>
+                                    {ttsNote}
+                                  </span>
+                                )}
+                              </div>
+
+                              <span style={{ fontSize: 12, lineHeight: '17px', color: 'var(--cth-ink-500)' }}>
+                                {t('settings.voice.localHint')}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+
                         {/* OpenAI Realtime key — settable HERE, not just described here.
                             This is where someone looking for voice actually lands (the Talk
                             button deep-links to it), so sending them to another tab to type
@@ -2000,8 +2212,14 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
                           <span style={sectionHeadFlush}>
                             {t('settings.voice.openaiKey')}
                           </span>
+                          {/* Both backends need this key — it runs the BRAIN either
+                              way — so the copy changes with the voice, not the
+                              field. Saying "voice API" while the audio is being
+                              synthesized locally would be a lie the user acts on. */}
                           <span style={{ fontSize: 12, lineHeight: '17px', color: 'var(--cth-ink-700)' }}>
-                            {t('settings.voice.openaiKeyDesc1', { godName, model: REALTIME_MODEL })}
+                            {voiceBackend === 'openai'
+                              ? t('settings.voice.openaiKeyDesc1', { godName, model: REALTIME_MODEL })
+                              : t('settings.voice.openaiKeyDesc1Local', { godName, model: REALTIME_MODEL })}
                           </span>
                           <span style={{ fontSize: 12, lineHeight: '17px', color: 'var(--cth-ink-700)' }}>
                             {t('settings.voice.openaiKeyDesc2')}

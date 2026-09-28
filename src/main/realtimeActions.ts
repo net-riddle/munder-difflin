@@ -40,6 +40,12 @@ import type { ScheduledMission } from './config';
 import { inferAgentProvider } from '../shared/agentProvider';
 import { clearCommandForProvider } from '../shared/providerAutomation';
 import { resolveGodName } from '../shared/godIdentity';
+import { type VoicePhrase, type VoiceVars, quotedCardTitles, interpolate } from '../shared/voicePhrases';
+
+/** The reason text when a lower layer returns an empty error. A variable, not a
+ *  concatenation: ", unknown error." glued on in main is English in every
+ *  language. */
+const UNKNOWN_ERROR = 'unknown error';
 
 export const VOICE_ACTOR = 'michael-voice';
 
@@ -88,14 +94,31 @@ export interface RealtimeActionDeps {
   patchConfig(patch: Record<string, unknown>): void;
 }
 
-/** The result every action / confirm / cancel returns to the renderer tool, which
- *  hands `spoken` straight to the model to say. */
+/**
+ * The result every action / confirm / cancel returns to the renderer tool, which
+ * hands `phrase` straight to the model to say.
+ *
+ * `phrase` is a KEY plus variables, not a sentence — see shared/voicePhrases.ts
+ * for why main cannot localize it. The renderer resolves it in the user's
+ * language before the model ever sees it. `spoken` is kept ONLY for the paths
+ * where a lower layer returned free text (an error from the spawner, a message
+ * composed by the completion watcher): those are not ours to phrase, and
+ * wrapping them in a key would be inventing a translation for a message the
+ * user never chose to be translated.
+ */
 export interface ActionResult {
   ok: boolean;
-  spoken: string;
+  /** What to say, as data. Localized by the renderer. */
+  phrase?: VoicePhrase;
+  /** Free text from a lower layer, used verbatim when there is no phrase. */
+  spoken?: string;
   /** true when a destructive op is now PENDING a verbal confirm. */
   needsConfirm?: boolean;
 }
+
+/** Build a result that says `key` with `vars`. The only constructor a phrase
+ *  result should use, so `phrase` is never spelled out wrongly at a call site. */
+const say = (key: string, vars?: VoiceVars): Pick<ActionResult, 'phrase'> => ({ phrase: { key, vars } });
 
 type Tier = 'soft' | 'destructive';
 
@@ -253,7 +276,8 @@ interface Pending {
   confirmWord: string;
   targetLabel: string;
   createdAt: number;
-  commit: () => Promise<string>;
+  /** Returns WHAT TO SAY as a phrase, not a sentence — the renderer localizes it. */
+  commit: () => Promise<VoicePhrase>;
 }
 let pending: Pending | null = null;
 
@@ -310,7 +334,7 @@ function execPing(deps: RealtimeActionDeps, a: Record<string, unknown>): ActionR
   const message = str(a.message) || str(a.text) || 'Checking in.';
   deps.hiveSend({ to: r.id, act: 'inform', subject: `Voice ping from ${resolveGodName(reg.agents[reg.godId ?? 'god']?.name)}`, body: message }, VOICE_ACTOR);
   attribute(deps, 'ping', r.id);
-  return { ok: true, spoken: `Pinged ${r.name}.` };
+  return { ok: true, ...say('ping.done', { who: r.name }) };
 }
 
 function execDispatch(deps: RealtimeActionDeps, a: Record<string, unknown>): ActionResult {
@@ -318,7 +342,7 @@ function execDispatch(deps: RealtimeActionDeps, a: Record<string, unknown>): Act
   const r = resolveAgent(str(a.agentId) || str(a.target) || str(a.name), reg);
   if ('error' in r) return { ok: false, spoken: r.error };
   const objective = str(a.objective) || str(a.task) || str(a.message);
-  if (!objective) return { ok: false, spoken: 'What should I dispatch? I need an objective.' };
+  if (!objective) return { ok: false, ...say('dispatch.no_objective') };
   // 4-part contract → the agent's inbox.
   const body =
     `OBJECTIVE: ${objective}\n` +
@@ -332,7 +356,7 @@ function execDispatch(deps: RealtimeActionDeps, a: Record<string, unknown>): Act
   attribute(deps, 'dispatch', r.id, { objective: objective.slice(0, 120) });
   // rt-12: register so the completion watcher can tell us when r.id finishes.
   deps.trackDispatch?.({ correlationId: msg.id, targetAgentId: r.id, objective, dispatchedAt: Date.now(), dispatchMessageId: msg.id });
-  return { ok: true, spoken: `Dispatched to ${r.name}: ${objective.slice(0, 80)}.` };
+  return { ok: true, ...say('dispatch.done', { who: r.name, what: objective.slice(0, 80) }) };
 }
 
 function execSteer(deps: RealtimeActionDeps, a: Record<string, unknown>): ActionResult {
@@ -340,15 +364,15 @@ function execSteer(deps: RealtimeActionDeps, a: Record<string, unknown>): Action
   const r = resolveAgent(str(a.agentId) || str(a.target) || str(a.name), reg);
   if ('error' in r) return { ok: false, spoken: r.error };
   const text = str(a.text) || str(a.message) || str(a.steer);
-  if (!text) return { ok: false, spoken: 'What guidance should I steer them with?' };
+  if (!text) return { ok: false, ...say('steer.no_text') };
   deps.controlSteer(r.id, `[${VOICE_ACTOR}] ${text}`);
   attribute(deps, 'steer', r.id, { text: text.slice(0, 120) });
-  return { ok: true, spoken: `Steering ${r.name}: ${text.slice(0, 80)}.` };
+  return { ok: true, ...say('steer.done', { who: r.name, what: text.slice(0, 80) }) };
 }
 
 function execCreateTask(deps: RealtimeActionDeps, a: Record<string, unknown>): ActionResult {
   const title = str(a.title) || str(a.task) || str(a.name);
-  if (!title) return { ok: false, spoken: 'What should the task be titled?' };
+  if (!title) return { ok: false, ...say('task.no_title') };
   const tasks = findTasks(deps);
   const id = `${slug(title)}-${shortId()}`;
   const card: HiveTask = {
@@ -363,7 +387,11 @@ function execCreateTask(deps: RealtimeActionDeps, a: Record<string, unknown>): A
   };
   deps.hiveWriteTasks([...tasks, card]);
   attribute(deps, 'create_task', id, { title: title.slice(0, 120), assignee: card.assignee });
-  return { ok: true, spoken: `Created task "${title}"${card.assignee ? `, assigned to ${card.assignee}` : ''}.` };
+  // Two keys, not one with an optional fragment: the ", assigned to" clause is
+  // part of the sentence, and a language may order it differently.
+  return card.assignee
+    ? { ok: true, ...say('task.created_assigned', { what: title, who: card.assignee }) }
+    : { ok: true, ...say('task.created', { what: title }) };
 }
 
 // Match-only normalizer: strips ALL non-alphanumerics (hyphens included) so a
@@ -421,35 +449,37 @@ function findCard(
 function execAssignTask(deps: RealtimeActionDeps, a: Record<string, unknown>): ActionResult {
   const ref = str(a.taskId) || str(a.task) || str(a.title);
   const assignee = str(a.assignee) || str(a.to) || str(a.agentId);
-  if (!ref || !assignee) return { ok: false, spoken: 'I need both a task and who to assign it to.' };
+  if (!ref || !assignee) return { ok: false, ...say('assign.needs_both') };
   const { tasks, card, ambiguous } = findCard(deps, ref);
   if (ambiguous) {
-    return { ok: false, spoken: `Which one — ${ambiguous.map((c) => `"${c.title}"`).join(', or ')}?` };
+    return { ok: false, ...say('task.ambiguous', { list: quotedCardTitles(ambiguous) }) };
   }
-  if (!card) return { ok: false, spoken: `I couldn't find a task matching "${ref}".` };
+  if (!card) return { ok: false, ...say('task.not_found', { ref }) };
   card.assignee = assignee;
   deps.hiveWriteTasks(tasks);
   attribute(deps, 'assign_task', card.id, { assignee });
-  return { ok: true, spoken: `Assigned "${card.title}" to ${assignee}.` };
+  return { ok: true, ...say('assign.done', { what: card.title, who: assignee }) };
 }
 
 function execUpdateTask(deps: RealtimeActionDeps, a: Record<string, unknown>): ActionResult {
   const ref = str(a.taskId) || str(a.task) || str(a.title);
-  if (!ref) return { ok: false, spoken: 'Which task should I update?' };
+  if (!ref) return { ok: false, ...say('update.no_ref') };
   const { tasks, card, ambiguous } = findCard(deps, ref);
   if (ambiguous) {
-    return { ok: false, spoken: `Which one — ${ambiguous.map((c) => `"${c.title}"`).join(', or ')}?` };
+    return { ok: false, ...say('task.ambiguous', { list: quotedCardTitles(ambiguous) }) };
   }
-  if (!card) return { ok: false, spoken: `I couldn't find a task matching "${ref}".` };
+  if (!card) return { ok: false, ...say('task.not_found', { ref }) };
   const status = str(a.status);
   const valid = ['todo', 'doing', 'blocked', 'done'];
-  if (status && !valid.includes(status)) return { ok: false, spoken: `"${status}" isn't a valid status.` };
+  if (status && !valid.includes(status)) return { ok: false, ...say('update.bad_status', { status }) };
   if (status) card.status = status as HiveTask['status'];
   if (str(a.result)) card.result = str(a.result);
   if (str(a.assignee)) card.assignee = str(a.assignee);
   deps.hiveWriteTasks(tasks);
   attribute(deps, 'update_task', card.id, { status: card.status });
-  return { ok: true, spoken: `Updated "${card.title}"${status ? ` to ${status}` : ''}.` };
+  return status
+    ? { ok: true, ...say('update.done_status', { what: card.title, status }) }
+    : { ok: true, ...say('update.done', { what: card.title }) };
 }
 
 // ─── v0.3.4 soft executors ──────────────────────────────────────────────────
@@ -459,22 +489,22 @@ function execResume(deps: RealtimeActionDeps, a: Record<string, unknown>): Actio
   if ('error' in r) return { ok: false, spoken: r.error };
   deps.controlResume(r.id);
   attribute(deps, 'resume', r.id);
-  return { ok: true, spoken: `Resumed ${r.name} — tools flow again.` };
+  return { ok: true, ...say('resume.done', { who: r.name }) };
 }
 
 function execAutoDelivery(deps: RealtimeActionDeps, a: Record<string, unknown>): ActionResult {
   const r = resolveAgent(str(a.agentId) || str(a.target) || str(a.name), deps.hiveRegistry());
   if ('error' in r) return { ok: false, spoken: r.error };
   const raw = norm(str(a.state) || str(a.action) || (a.paused === true ? 'pause' : a.paused === false ? 'resume' : ''));
-  if (!raw) return { ok: false, spoken: 'Should I pause or resume message delivery?' };
+  if (!raw) return { ok: false, ...say('delivery.no_raw') };
   const paused = /pause|off|hold|stop/.test(raw);
   deps.controlAutoDelivery(r.id, paused);
   attribute(deps, 'auto_delivery', r.id, { action: paused ? 'paused' : 'resumed' });
   return {
     ok: true,
-    spoken: paused
-      ? `Paused automatic delivery to ${r.name} — queued messages will wait.`
-      : `Resumed automatic delivery to ${r.name}.`
+    ...(paused
+      ? say('delivery.paused', { who: r.name })
+      : say('delivery.resumed', { who: r.name }))
   };
 }
 
@@ -483,24 +513,24 @@ function execGateTool(deps: RealtimeActionDeps, a: Record<string, unknown>): Act
   if ('error' in r) return { ok: false, spoken: r.error };
   const toolName = str(a.tool) || str(a.toolName);
   if (!toolName || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(toolName)) {
-    return { ok: false, spoken: 'Which tool should I gate? Give me its exact name, like Bash or WebFetch.' };
+    return { ok: false, ...say('gate.no_tool') };
   }
   const raw = norm(str(a.state) || str(a.action));
   const on = !/off|allow|ungate|unblock|enable/.test(raw); // default: gate it
   deps.controlGateTool(r.id, toolName, on);
   attribute(deps, 'gate_tool', r.id, { action: `${on ? 'gated' : 'ungated'} ${toolName}` });
-  return { ok: true, spoken: `${on ? 'Gated' : 'Un-gated'} the ${toolName} tool for ${r.name}.` };
+  return { ok: true, ...say(on ? 'gate.done_on' : 'gate.done_off', { tool: toolName, who: r.name }) };
 }
 
 function execDeleteTask(deps: RealtimeActionDeps, a: Record<string, unknown>): ActionResult {
   const ref = str(a.taskId) || str(a.task) || str(a.title);
-  if (!ref) return { ok: false, spoken: 'Which task should I delete?' };
+  if (!ref) return { ok: false, ...say('delete.no_ref') };
   const { tasks, card, ambiguous } = findCard(deps, ref);
-  if (ambiguous) return { ok: false, spoken: `Which one — ${ambiguous.map((c) => `"${c.title}"`).join(', or ')}?` };
-  if (!card) return { ok: false, spoken: `I couldn't find a task matching "${ref}".` };
+  if (ambiguous) return { ok: false, ...say('task.ambiguous', { list: quotedCardTitles(ambiguous) }) };
+  if (!card) return { ok: false, ...say('task.not_found', { ref }) };
   deps.hiveWriteTasks(tasks.filter((t) => t.id !== card.id));
   attribute(deps, 'delete_task', card.id, { title: card.title.slice(0, 120) });
-  return { ok: true, spoken: `Deleted the task "${card.title}". Recreate it any time if that was wrong.` };
+  return { ok: true, ...say('delete.done', { what: card.title }) };
 }
 
 function execUnarchive(deps: RealtimeActionDeps, a: Record<string, unknown>): ActionResult {
@@ -509,45 +539,53 @@ function execUnarchive(deps: RealtimeActionDeps, a: Record<string, unknown>): Ac
   const res = deps.setArchived(r.id, false);
   attribute(deps, 'unarchive', r.id);
   return res.ok
-    ? { ok: true, spoken: `Brought ${r.name} back from the archive.` }
-    : { ok: false, spoken: `Couldn't unarchive ${r.name}: ${res.error || 'unknown error'}.` };
+    ? { ok: true, ...say('unarchive.done', { who: r.name }) }
+    : { ok: false, ...say('unarchive.failed', { who: r.name, reason: res.error || UNKNOWN_ERROR }) };
 }
 
 // ─── destructive commit builders (run AFTER confirm) ────────────────────────
+//
+// These return a VoicePhrase rather than a string: the renderer resolves it in
+// the user's language. `unknown error` is passed as a `reason` variable so the
+// sentence structure stays in the locale file — main must not concatenate.
 
-function buildKill(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<string> {
+function buildKill(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<VoicePhrase> {
   return async () => {
     const res = deps.killAgent(r.id);
     attribute(deps, 'kill', r.id);
-    return res.ok ? `Killed ${r.name}.` : `Couldn't kill ${r.name}: ${res.error || 'unknown error'}.`;
+    return res.ok
+      ? { key: 'kill.done', vars: { who: r.name } }
+      : { key: 'kill.failed', vars: { who: r.name, reason: res.error || UNKNOWN_ERROR } };
   };
 }
 
-function buildPause(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<string> {
+function buildPause(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<VoicePhrase> {
   return async () => {
     deps.controlPause(r.id, true);
     attribute(deps, 'pause', r.id);
-    return `Paused ${r.name}.`;
+    return { key: 'pause.done', vars: { who: r.name } };
   };
 }
 
-function buildHalt(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<string> {
+function buildHalt(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<VoicePhrase> {
   return async () => {
     deps.controlHalt(r.id);
     attribute(deps, 'halt', r.id);
-    return `Halted ${r.name}.`;
+    return { key: 'halt.done', vars: { who: r.name } };
   };
 }
 
-function buildSpawn(deps: RealtimeActionDeps, spec: RealtimeSpawnSpec, label: string): () => Promise<string> {
+function buildSpawn(deps: RealtimeActionDeps, spec: RealtimeSpawnSpec, label: string): () => Promise<VoicePhrase> {
   return async () => {
     const res = await deps.spawnAgent(spec);
     attribute(deps, 'spawn', spec.id, { provider: spec.provider, role: spec.hive?.role });
-    return res.ok ? `Hired ${label}.` : `Couldn't hire ${label}: ${res.error || 'unknown error'}.`;
+    return res.ok
+      ? { key: 'hire.done', vars: { who: label } }
+      : { key: 'hire.failed', vars: { who: label, reason: res.error || UNKNOWN_ERROR } };
   };
 }
 
-function buildClearContext(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<string> {
+function buildClearContext(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<VoicePhrase> {
   return async () => {
     // '/clear' is NOT universal — it was hardcoded here for every provider, which
     // meant Grok/OpenCode/pi (whose verb is '/new') got a literal "/clear" typed
@@ -557,23 +595,23 @@ function buildClearContext(deps: RealtimeActionDeps, r: ResolvedAgent): () => Pr
     const provider = inferAgentProvider(undefined, deps.hiveRegistry().agents?.[r.id]?.provider);
     const command = clearCommandForProvider(provider);
     if (!command) {
-      return `${r.name} runs on ${provider}, which has no context-clear command I can type. Clear it from their terminal.`;
+      return { key: 'clear.no_command', vars: { who: r.name, tool: provider } };
     }
     // Queue through the renderer message queue: delivery inherits every existing
     // safety gate (idle-only, boot grace, draft/picker protection).
     deps.enqueueToAgent(r.id, command);
     attribute(deps, 'clear_context', r.id);
-    return `Queued a context clear for ${r.name} — it lands the moment they're idle.`;
+    return { key: 'clear.queued', vars: { who: r.name } };
   };
 }
 
-function buildArchive(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<string> {
+function buildArchive(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<VoicePhrase> {
   return async () => {
     const res = deps.setArchived(r.id, true);
     attribute(deps, 'archive', r.id);
     return res.ok
-      ? `Archived ${r.name} — off the floor, history kept. Say unarchive to bring them back.`
-      : `Couldn't archive ${r.name}: ${res.error || 'unknown error'}.`;
+      ? { key: 'archive.done', vars: { who: r.name } }
+      : { key: 'archive.failed', vars: { who: r.name, reason: res.error || UNKNOWN_ERROR } };
   };
 }
 
@@ -581,7 +619,7 @@ function buildEditSchedule(
   deps: RealtimeActionDeps,
   mission: ScheduledMission,
   action: 'enable' | 'disable' | 'delete'
-): () => Promise<string> {
+): () => Promise<VoicePhrase> {
   return async () => {
     const all = deps.listMissions();
     let next: ScheduledMission[];
@@ -589,7 +627,10 @@ function buildEditSchedule(
     else next = all.map((m) => (m.id === mission.id ? { ...m, enabled: action === 'enable' } : m));
     deps.saveMissions(next);
     attribute(deps, 'edit_schedule', mission.id, { action });
-    return `${action === 'delete' ? 'Deleted' : action === 'enable' ? 'Enabled' : 'Disabled'} the "${mission.label}" schedule.`;
+    return {
+      key: action === 'delete' ? 'schedule.deleted' : action === 'enable' ? 'schedule.enabled' : 'schedule.disabled',
+      vars: { what: mission.label }
+    };
   };
 }
 
@@ -603,14 +644,14 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
   if (spec.agentTargeted) {
     const rawTarget = str(a.agentId) || str(a.target) || str(a.name);
     if (isMassTarget(rawTarget))
-      return { ok: false, spoken: `${verb} on all agents at once is voice-forbidden. Do it agent by agent, or use the UI.` };
+      return { ok: false, ...say('dispatch.all_forbidden', { verb }) };
     const r = resolveAgent(rawTarget, reg);
     if ('error' in r) return { ok: false, spoken: r.error };
     // God policy per verb: kill/pause/halt/archive on god stay voice-forbidden.
     // clear_context on god is ALLOWED behind confirm — it's recoverable
     // (sessions resume) and "clear Michael's context" is a real operator need.
     if (r.isGod && verb !== 'clear_context')
-      return { ok: false, spoken: `${verb} on the god orchestrator is voice-forbidden. That has to be done in the UI.` };
+      return { ok: false, ...say('dispatch.god_forbidden', { verb }) };
 
     const commit =
       verb === 'kill' ? buildKill(deps, r)
@@ -619,17 +660,28 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
       : verb === 'clear_context' ? buildClearContext(deps, r)
       : buildArchive(deps, r);
     const breaker = deps.controlSnapshot(r.id);
-    const note = breaker?.halted ? ' (note: already halted)' : breaker?.paused ? ' (note: already paused)' : '';
-    pending = { verb, confirmWord: spec.confirmWord, targetLabel: r.name, createdAt: Date.now(), commit };
-    const consequence = verb === 'clear_context'
-      ? `That wipes ${r.name}'s working memory of the current conversation.`
+    // The breaker notes are a suffix on the same sentence; two keys rather than
+    // an interpolated fragment, so the structure stays in the locale file.
+    const noteKey = breaker?.halted ? 'confirm.note_halted' : breaker?.paused ? 'confirm.note_paused' : 'confirm.note_none';
+    const consequenceKey = verb === 'clear_context'
+      ? 'confirm.consequence_clear'
       : verb === 'archive'
-        ? `That takes ${r.name} off the floor (history kept).`
-        : `That's destructive.`;
+        ? 'confirm.consequence_archive'
+        : 'confirm.consequence_generic';
+    pending = { verb, confirmWord: spec.confirmWord, targetLabel: r.name, createdAt: Date.now(), commit };
     return {
       ok: true,
       needsConfirm: true,
-      spoken: `You asked me to ${verb.replace('_', ' ')} ${r.name}${note}. ${consequence} To go ahead, say "confirm" or "${spec.confirmWord}". Say "cancel" to stop.`
+      ...say('confirm.destructive', {
+        verb: verb.replace('_', ' '),
+        who: r.name,
+        // Slots: the resolver renders each as its own phrase, in this language.
+        // `who` is repeated into the consequence slot because "that wipes HER
+        // memory" needs the name and the slot renders standalone.
+        note: `{{${noteKey}}}`,
+        consequence: `{{${consequenceKey}}}`,
+        confirmWord: spec.confirmWord
+      })
     };
   }
 
@@ -641,7 +693,7 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
     const godCwd = reg.godId ? reg.agents[reg.godId]?.cwd : undefined;
     const cwd =
       str(a.cwd) || godCwd || Object.values(reg.agents).find((m) => m.cwd)?.cwd || '';
-    if (!cwd) return { ok: false, spoken: 'I need a working directory to hire into — none is configured.' };
+    if (!cwd) return { ok: false, ...say('hire.no_cwd') };
     const command = str(a.command) || PROVIDER_COMMAND[provider] || 'claude';
     const id = `${slug(name)}-${shortId()}`;
     const spec2: RealtimeSpawnSpec = { id, cwd, command, provider, hive: { id, name, provider, role: role || undefined, cwd } };
@@ -650,21 +702,28 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
       ok: true,
       needsConfirm: true,
       // Spawn/hire is gated behind a verbal echo-back confirm. No cost is quoted —
-      // the orchestrator persona does not surface money to the user.
-      spoken: `You want to hire a new ${provider} agent${role ? ` as ${role}` : ''}, named ${name}. To hire, say "confirm" or "spawn". Say "cancel" to stop.`
+      // the orchestrator persona does not surface money to the user. The "as
+      // <role>" clause is a slot: some languages place the role before the name.
+      ...say('confirm.spawn', {
+        tool: provider,
+        who: name,
+        role: role ? `{{confirm.spawn_role}}` : '{{confirm.spawn_no_role}}'
+      })
     };
   }
 
   // edit_schedule
   if (verb === 'edit_schedule') {
     const missions = deps.listMissions();
-    if (!missions.length) return { ok: false, spoken: 'There are no scheduled missions to edit.' };
+    if (!missions.length) return { ok: false, ...say('schedule.none') };
     const ref = norm(str(a.missionId) || str(a.schedule) || str(a.label) || str(a.target));
     const m =
       missions.find((x) => x.id.toLowerCase() === ref) ||
       missions.find((x) => (x.label || '').toLowerCase() === ref) ||
       missions.find((x) => (x.label || '').toLowerCase().includes(ref) || x.id.toLowerCase().includes(ref));
-    if (!m) return { ok: false, spoken: ref ? `I couldn't find a schedule matching "${str(a.label) || ref}".` : 'Which schedule should I edit?' };
+    if (!m) return ref
+      ? { ok: false, ...say('schedule.not_found', { ref: str(a.label) || ref }) }
+      : { ok: false, ...say('schedule.which') };
     const raw = norm(str(a.action) || str(a.op));
     const action: 'enable' | 'disable' | 'delete' =
       raw.includes('delete') || raw.includes('remove') ? 'delete' : raw.includes('disable') || raw.includes('off') || raw.includes('pause') ? 'disable' : 'enable';
@@ -678,7 +737,7 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
     return {
       ok: true,
       needsConfirm: true,
-      spoken: `You want to ${action} the "${m.label}" schedule. To go ahead, say "confirm" or "schedule". Say "cancel" to stop.`
+      ...say('confirm.schedule_action', { verb: action, what: m.label })
     };
   }
 
@@ -686,7 +745,7 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
   if (verb === 'create_schedule') {
     const label = str(a.label) || str(a.name) || str(a.title);
     const body = str(a.prompt) || str(a.body) || str(a.message);
-    if (!label || !body) return { ok: false, spoken: 'I need a name for the schedule and what it should tell the agent.' };
+    if (!label || !body) return { ok: false, ...say('schedule.needs_both') };
     const minutes = typeof a.intervalMinutes === 'number' && isFinite(a.intervalMinutes)
       ? Math.min(7 * 24 * 60, Math.max(5, Math.round(a.intervalMinutes)))
       : 60;
@@ -706,13 +765,13 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
       commit: async () => {
         deps.saveMissions([...deps.listMissions(), mission]);
         attribute(deps, 'create_schedule', mission.id, { title: label.slice(0, 120) });
-        return `Created the "${label}" schedule — every ${minutes} minutes to ${targetId}.`;
+        return { key: 'schedule.created', vars: { what: label, value: String(minutes), who: targetId } };
       }
     };
     return {
       ok: true,
       needsConfirm: true,
-      spoken: `You want a new schedule "${label}", every ${minutes} minutes, messaging ${targetId}. To create it, say "confirm" or "schedule". Say "cancel" to stop.`
+      ...say('confirm.schedule_new', { what: label, value: String(minutes), who: targetId })
     };
   }
 
@@ -720,61 +779,74 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
   if (verb === 'update_setting') {
     const key = str(a.key) || str(a.setting) || str(a.name);
     const policy = SETTING_POLICY[key];
-    if (!key) return { ok: false, spoken: 'Which setting should I change?' };
+    if (!key) return { ok: false, ...say('setting.which') };
     if (!policy) {
-      return { ok: false, spoken: `The "${key}" setting can't be changed by voice — use the Settings screen for that one.` };
+      return { ok: false, ...say('setting.voice_forbidden', { key }) };
     }
     // Coerce + validate the value against the key's declared type.
     let value: unknown = a.value;
     if (policy.type === 'boolean') {
       if (typeof value === 'string') value = /^(true|on|yes|enable|enabled|1)$/i.test(value.trim());
-      if (typeof value !== 'boolean') return { ok: false, spoken: `Should ${key} be on or off?` };
+      if (typeof value !== 'boolean') return { ok: false, ...say('setting.need_onoff', { key }) };
     } else if (policy.type === 'number') {
       if (typeof value === 'string') value = parseFloat(value);
-      if (typeof value !== 'number' || !isFinite(value)) return { ok: false, spoken: `What number should ${key} be?` };
-      if (policy.min !== undefined && value < policy.min) return { ok: false, spoken: `${key} can't go below ${policy.min}.` };
-      if (policy.max !== undefined && value > policy.max) return { ok: false, spoken: `${key} can't go above ${policy.max}.` };
+      if (typeof value !== 'number' || !isFinite(value)) return { ok: false, ...say('setting.need_number', { key }) };
+      if (policy.min !== undefined && value < policy.min) {
+        return { ok: false, ...say('setting.below_min', { key, bound: String(policy.min) }) };
+      }
+      if (policy.max !== undefined && value > policy.max) {
+        return { ok: false, ...say('setting.above_max', { key, bound: String(policy.max) }) };
+      }
       value = Math.round(value as number);
     } else {
       if (typeof value !== 'string' || !value.trim() || value.length > 200) {
-        return { ok: false, spoken: `What should ${key} be set to?` };
+        return { ok: false, ...say('setting.need_value', { key }) };
       }
       value = value.trim();
       if (policy.values && !policy.values.includes(value as string)) {
-        return { ok: false, spoken: `${key} must be one of: ${policy.values.join(', ')}.` };
+        return { ok: false, ...say('setting.must_be_one', { key, list: policy.values.join(', ') }) };
       }
     }
     const oldValue = deps.getConfigValue(key);
-    const describe = (v: unknown): string => typeof v === 'boolean' ? (v ? 'on' : 'off') : String(v ?? 'unset');
+    // 'on' / 'off' are WORDS, not a boolean: they are interpolated into a
+    // sentence, so they must be resolved by the locale. A slot key per state,
+    // and an empty one for a non-boolean so nothing has to be translated.
+    const describe = (v: unknown): string =>
+      typeof v === 'boolean'
+        ? `{{setting.state_${v ? 'on' : 'off'}}}`
+        : String(v ?? '{{setting.state_unset}}');
     if (describe(oldValue) === describe(value)) {
-      return { ok: true, spoken: `${key} is already ${describe(value)} — nothing to change.` };
+      return { ok: true, ...say('setting.unchanged', { key, onoff: describe(value) }) };
     }
-    const applyNow = (): string => {
+    // Returns the phrase, not a sentence: the renderer localizes it. The
+    // `describe()` below already resolves booleans to a SLOT key, so this
+    // hands back a template for the renderer to fill, not an English string.
+    const applyNow = (): VoicePhrase => {
       deps.patchConfig({ [key]: value });
-      attribute(deps, 'update_setting', key, { action: `${describe(oldValue)} → ${describe(value)}` });
-      return `Done — ${key} is now ${describe(value)} (was ${describe(oldValue)}).`;
+      attribute(deps, 'update_setting', key, { action: `${String(oldValue)} → ${String(value)}` });
+      return { key: 'setting.applied', vars: { key, onoff: describe(value), was: describe(oldValue) } };
     };
     if (policy.tier === 'soft') {
       // Low-blast keys apply immediately, like other soft verbs.
-      return { ok: true, spoken: applyNow() };
+      return { ok: true, ...applyNow() };
     }
     pending = { verb, confirmWord: 'setting', targetLabel: key, createdAt: Date.now(), commit: async () => applyNow() };
     return {
       ok: true,
       needsConfirm: true,
-      spoken: `${key} is ${describe(oldValue)}; you want it ${describe(value)}. To change it, say "confirm" or "setting". Say "cancel" to stop.`
+      ...say('confirm.setting', { key, was: describe(oldValue), now: describe(value) })
     };
   }
 
-  return { ok: false, spoken: `I don't know how to ${verb}.` };
+  return { ok: false, ...say('unknown.verb', { verb }) };
 }
 
 /** Top-level propose/execute for one verb. Soft writes run now; destructive ones
  *  stage a pending and ask for verbal confirm. */
 function runAction(deps: RealtimeActionDeps, verb: string, a: Record<string, unknown>): ActionResult {
-  if (!deps.hiveEnabled()) return { ok: false, spoken: 'The hive is not configured, so I can\'t take that action.' };
+  if (!deps.hiveEnabled()) return { ok: false, ...say('hive.not_configured') };
   const spec = VERBS[verb];
-  if (!spec) return { ok: false, spoken: `I don't have an action called "${verb}".` };
+  if (!spec) return { ok: false, ...say('action.unknown', { verb }) };
   // Any new proposal supersedes a stale pending.
   pending = null;
   if (spec.tier === 'soft') {
@@ -790,7 +862,7 @@ function runAction(deps: RealtimeActionDeps, verb: string, a: Record<string, unk
       case 'gate_tool': return execGateTool(deps, a);
       case 'delete_task': return execDeleteTask(deps, a);
       case 'unarchive': return execUnarchive(deps, a);
-      default: return { ok: false, spoken: `I don't know how to ${verb}.` };
+      default: return { ok: false, ...say('unknown.verb', { verb }) };
     }
   }
   return proposeDestructive(deps, verb, a);
@@ -835,24 +907,24 @@ export function registerRealtimeActionIpc(deps: RealtimeActionDeps): void {
       const res = runAction(deps, verb, p);
       // A non-ok result is an EXPECTED friendly rejection (bad target, hive off, etc.) —
       // log it quietly so a live repro can still be correlated, but it is not an error.
-      if (!res.ok) console.warn(`[realtime-action] verb=${verb} rejected: ${res.spoken}`);
+      if (!res.ok) console.warn(`[realtime-action] verb=${verb} rejected: ${res.phrase?.key ?? res.spoken}`);
       return res;
     } catch (e) {
       logActionFailure(deps, 'realtime:action', verb, e);
-      const msg = e instanceof Error ? e.message : 'unknown error';
-      return { ok: false, spoken: `That action failed: ${msg}.` } satisfies ActionResult;
+      const msg = e instanceof Error ? e.message : UNKNOWN_ERROR;
+      return { ok: false, ...say('action.failed', { reason: msg }) } satisfies ActionResult;
     }
   });
 
   ipcMain.handle('realtime:action:confirm', async (_evt, payload: unknown) => {
     const p = (payload ?? {}) as Record<string, unknown>;
     const cur = pendingFresh();
-    if (!cur) return { ok: false, spoken: 'There\'s nothing waiting to confirm.' } satisfies ActionResult;
+    if (!cur) return { ok: false, ...say('confirm.none_pending') } satisfies ActionResult;
     const phrase = str(p.phrase) || str(p.confirm) || str(p.text);
     if (!confirmAccepted(phrase, cur.confirmWord)) {
       return {
         ok: false,
-        spoken: `I won't ${cur.verb} ${cur.targetLabel} on that — for safety I need you to say "confirm" or "${cur.confirmWord}", not just yes. Say it clearly, or say cancel.`
+        ...say('confirm.refused', { verb: cur.verb, who: cur.targetLabel, confirmWord: cur.confirmWord })
       } satisfies ActionResult;
     }
     const commit = cur.commit;
@@ -860,17 +932,19 @@ export function registerRealtimeActionIpc(deps: RealtimeActionDeps): void {
     pending = null; // consume before running so a failure can't be re-confirmed
     try {
       const spoken = await commit();
-      return { ok: true, spoken } satisfies ActionResult;
+      return { ok: true, phrase: spoken } satisfies ActionResult;
     } catch (e) {
       logActionFailure(deps, 'realtime:action:confirm', verb, e);
-      const msg = e instanceof Error ? e.message : 'unknown error';
-      return { ok: false, spoken: `That action failed: ${msg}.` } satisfies ActionResult;
+      const msg = e instanceof Error ? e.message : UNKNOWN_ERROR;
+      return { ok: false, ...say('action.failed', { reason: msg }) } satisfies ActionResult;
     }
   });
 
   ipcMain.handle('realtime:action:cancel', async () => {
     const had = pendingFresh();
     pending = null;
-    return { ok: true, spoken: had ? `Cancelled the ${had.verb}.` : 'Nothing to cancel.' } satisfies ActionResult;
+    return had
+      ? { ok: true, ...say('cancel.done', { verb: had.verb }) } satisfies ActionResult
+      : { ok: true, ...say('cancel.nothing') } satisfies ActionResult;
   });
 }

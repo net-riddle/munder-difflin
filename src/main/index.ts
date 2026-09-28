@@ -53,6 +53,8 @@ import { registerRealtimeIpc } from './realtime';
 import { registerRealtimeActionIpc } from './realtimeActions';
 import { initCompletionWatcher } from './realtimeCompletionWatcher';
 import type { TaskCard, InboxMessage } from './realtimeCompletionWatcher';
+import { TaskDoneAnnouncer } from './taskDoneAnnouncer';
+import { normalizeVoiceBackend } from '../shared/realtimeVoice';
 import { TelemetryCollector } from './telemetry';
 import { CostLedgerTotals } from './costLifetime';
 import { analytics, isRendererMessageSurface } from './analytics';
@@ -4455,6 +4457,37 @@ ipcMain.handle('realtime:waitFor', (_e, taskId: unknown, timeoutMs: unknown) =>
     ? completionWatcher.waitFor(taskId, typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : 120_000)
     : Promise.resolve({ timedOut: true as const, taskId: '' }));
 completionWatcher.start();
+
+// ─── Task-done announcements (local voice, NO OpenAI) ───────────────────────
+// Deliberately separate from completionWatcher above: that one only tracks work
+// VOICE MICHAEL dispatched, so it depends on a live session and therefore on
+// credits. This one watches any card flipping to `done` and speaks it through
+// the local TTS server, so the notification keeps working when the credit
+// balance is empty. See src/main/taskDoneAnnouncer.ts.
+const taskDoneAnnouncer = new TaskDoneAnnouncer({
+  tasks: () => (hive.tasks() as { tasks?: TaskCard[] } | null)?.tasks ?? [],
+  nameOf: (id) => {
+    // Friendly name for a spoken sentence: "oscar-mqp3l5wn finished" is noise,
+    // "Oscar finished" is the notification. Best-effort — the announcer falls
+    // back to the raw id when an agent is archived mid-flight. The registry is
+    // widened through `unknown` because the announcer only needs two fields and
+    // a cast to a partial shape would be rejected against the real type.
+    try {
+      const reg = hive.registry() as unknown as { agents?: { id?: string; name?: string }[] };
+      return reg.agents?.find((a) => a?.id === id)?.name ?? null;
+    } catch {
+      return null;
+    }
+  },
+  push: (evt) => {
+    try { liveWebContents()?.send('task:done', evt); } catch { /* window gone */ }
+  },
+  // The gate is the VOICE BACKEND, not a separate switch: a local voice is the
+  // only one that can announce without OpenAI, so there is nothing to configure
+  // and nothing that can end up announcing through a channel the user did not pick.
+  enabled: () => normalizeVoiceBackend(readConfig().realtimeVoiceBackend) === 'local-tts'
+});
+taskDoneAnnouncer.start();
 
 // ─── god-triggered ephemeral Slack workers ──────────────────────────────────
 // god drops a spawn-request JSON into HIVE_ROOT/spawn-requests/; MAIN polls that

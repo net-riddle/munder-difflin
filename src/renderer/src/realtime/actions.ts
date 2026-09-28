@@ -20,12 +20,54 @@
  *   tools: [...realtimeReadTools(), ...realtimeActionTools()]
  */
 import { tool } from '@openai/agents-realtime';
+import i18n from 'i18next';
+import { renderVoicePhrase, type VoiceVars } from '@shared/voicePhrases';
 
 const obj = (x: unknown): Record<string, unknown> =>
   x && typeof x === 'object' ? (x as Record<string, unknown>) : {};
 const str = (x: unknown): string => (typeof x === 'string' ? x : '');
 
-/** Forward a verb + args to the main action spine and return its spoken result.
+/** `t()` for a phrase that has no vars of its own, with an English fallback. */
+const t = (key: string, fallback?: string): string =>
+  (i18n.t(key) as unknown as string) || fallback || key;
+
+/** A phrase WITH vars, resolved through the same table main would have used.
+ *  Needed for the two error paths, whose text is a real sentence rather than a
+ *  fixed string. */
+const sayKey = (key: string, vars: VoiceVars): string =>
+  renderVoicePhrase(i18n.t.bind(i18n) as (k: string, v?: Record<string, unknown>) => string, { key, vars });
+
+/**
+ * Turn main's result into a sentence in the user's language.
+ *
+ * main returns `{ phrase: { key, vars } }` — a key plus data, NOT prose — because
+ * it cannot localize anything: the chosen language lives in this renderer's
+ * localStorage and main has no channel to it. Resolving the key here is the whole
+ * point of that split.
+ *
+ * `spoken` is still honoured for the paths main does not own: an error string
+ * from the spawner, a message composed elsewhere. Those are free text the user
+ * never chose to be translated, so wrapping them in a key would be inventing a
+ * translation for someone else's words.
+ */
+function sayIt(res: { phrase?: { key: string; vars?: Record<string, unknown> }; spoken?: string } | null | undefined): string {
+  if (res?.phrase) {
+    try {
+      return renderVoicePhrase(i18n.t.bind(i18n) as (k: string, v?: Record<string, unknown>) => string, {
+        key: res.phrase.key,
+        vars: res.phrase.vars as VoiceVars | undefined
+      });
+    } catch (e) {
+      // Never let the resolver take the voice loop down: fall through to the
+      // English table inside renderVoicePhrase, and if even that fails, speak
+      // whatever main gave us.
+      console.error('[realtime-action] phrase render failed', e, res.phrase);
+    }
+  }
+  return res?.spoken?.trim() || '';
+}
+
+/** Forward a verb + args to the main action spine and return what to say.
  *  Instrumented for the rt-5 live-bug: any failure is logged to the (human-visible)
  *  renderer console with the verb + raw args so the next repro is self-diagnosing. */
 async function act(verb: string, input: unknown): Promise<string> {
@@ -37,12 +79,12 @@ async function act(verb: string, input: unknown): Promise<string> {
   }
   try {
     const res = await window.cth.realtimeAction({ verb, ...obj(input) });
-    if (!res?.ok) console.warn('[realtime-action] verb=%s rejected: %s', verb, res?.spoken, { input });
-    return res?.spoken || 'Done.';
+    if (!res?.ok) console.warn('[realtime-action] verb=%s rejected: %s', verb, res?.phrase?.key ?? res?.spoken, { input });
+    return sayIt(res) || t('common.done', 'Done.');
   } catch (e) {
     console.error('[realtime-action] verb=%s threw:', verb, e, { input });
-    const msg = e instanceof Error ? e.message : 'an unknown error';
-    return `I couldn't do that (${msg}).`;
+    const msg = e instanceof Error ? e.message : t('voice.error.unknown_reason');
+    return sayKey('action.failed', { reason: msg });
   }
 }
 
@@ -391,12 +433,12 @@ export function realtimeActionTools(): ReturnType<typeof tool>[] {
         }
         try {
           const res = await window.cth.realtimeActionConfirm({ phrase: str(obj(input).phrase) });
-          if (!res?.ok) console.warn('[realtime-action] confirm rejected: %s', res?.spoken, { input });
-          return res?.spoken || 'Done.';
+          if (!res?.ok) console.warn('[realtime-action] confirm rejected: %s', res?.phrase?.key ?? res?.spoken, { input });
+          return sayIt(res) || t('common.done', 'Done.');
         } catch (e) {
           console.error('[realtime-action] confirm threw:', e, { input });
-          const msg = e instanceof Error ? e.message : 'an unknown error';
-          return `I couldn't confirm that (${msg}).`;
+          const msg = e instanceof Error ? e.message : t('voice.error.unknown_reason');
+          return sayKey('action.failed', { reason: msg });
         }
       }
     }),
@@ -407,10 +449,10 @@ export function realtimeActionTools(): ReturnType<typeof tool>[] {
       execute: async () => {
         try {
           const res = await window.cth?.realtimeActionCancel?.();
-          return res?.spoken || 'Cancelled.';
+          return sayIt(res) || t('voice.cancel.nothing');
         } catch (e) {
           console.error('[realtime-action] cancel threw:', e);
-          return 'Cancelled.';
+          return t('voice.cancel.nothing');
         }
       }
     })
