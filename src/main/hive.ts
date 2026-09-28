@@ -2583,7 +2583,12 @@ export class HiveManager {
 
   // — json + atomic io —
   private readJson<T>(p: string, fallback: T): T {
-    try { return JSON.parse(readFileSync(p, 'utf8')) as T; } catch { return fallback; }
+    try {
+      const raw = readFileSync(p, 'utf8');
+      // Strip a leading UTF-8 BOM so hand-edited or PowerShell-written JSON
+      // does not silently fall back to an empty default.
+      return JSON.parse(raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw) as T;
+    } catch { return fallback; }
   }
   private writeJson(p: string, data: unknown): void {
     writeFileSync(p, JSON.stringify(data, null, 2), 'utf8');

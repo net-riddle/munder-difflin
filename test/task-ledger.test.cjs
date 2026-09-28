@@ -170,3 +170,40 @@ test('hive.writeTasks can still empty the ledger', (t) => {
   hive.writeTasks([]);
   assert.deepEqual(ledger(), []);
 });
+
+// A UTF-8 BOM in front of tasks.json made JSON.parse throw, and readJson swallows
+// a throw and returns its FALLBACK. So one invisible 3-byte prefix did not corrupt
+// a card: it emptied the entire board, with no error anywhere. That is the exact
+// failure that emptied the kanban on 2026-09-28, and the reason a BOM must never
+// be written to this file. readJson now strips it instead of falling back.
+
+test('a BOM in front of tasks.json does not empty the ledger', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'md-task-ledger-bom-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const hive = new HiveManager(() => home);
+  const file = path.join(home, 'hive', 'tasks.json');
+
+  hive.writeTasks([richCard(), { id: 'other', title: 'Other', status: 'todo' }]);
+  const clean = fs.readFileSync(file, 'utf8');
+
+  // Hand-write the BOM a PowerShell `Set-Content -Encoding UTF8` leaves behind.
+  fs.writeFileSync(file, '\uFEFF' + clean, 'utf8');
+  assert.equal(fs.readFileSync(file, 'utf8').charCodeAt(0), 0xFEFF, 'precondition: BOM is on disk');
+
+  const read = hive.tasks();
+  assert.equal(read.tasks.length, 2,
+    `BOM emptied the ledger: got ${JSON.stringify(read.tasks)}`);
+  assert.equal(read.tasks[0].id, 'vxr-onboarding-review');
+  assert.equal(read.tasks[0].result, 'Reviewed. Three gaps found — posted verbatim to the Slack thread.',
+    'the fields past the first must survive too, not just the count');
+});
+
+test('a genuinely corrupt ledger still falls back instead of throwing', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'md-task-ledger-bad-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const hive = new HiveManager(() => home);
+  hive.writeTasks([richCard()]);
+  fs.writeFileSync(path.join(home, 'hive', 'tasks.json'), '{ this is not json', 'utf8');
+  assert.deepEqual(hive.tasks(), { tasks: [] },
+    'the fallback is the point: a broken ledger must not take the app down');
+});
