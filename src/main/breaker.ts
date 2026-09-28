@@ -22,6 +22,7 @@
  * de-escalates a level per healthy beat (recovery), and `hardStop` is OFF by
  * default — without it the ladder caps at `constrained` and never kills.
  */
+import { createHash } from 'node:crypto';
 import type { CircuitBreakerConfig } from './config';
 import type { AgentUsageSample } from './usage';
 
@@ -108,6 +109,13 @@ interface AgentBreakerState {
   noProgressBeats: number;
 }
 
+/** JSON.stringify that cannot throw — cycles, BigInt, null-prototype objects and
+ *  throwing getters all land here rather than taking the hook reply path down. */
+function safeStringify(v: unknown): string {
+  try { return JSON.stringify(v) ?? ''; } catch { /* not serialisable */ }
+  try { return String(v); } catch { return '?'; }
+}
+
 export class CircuitBreaker {
   private agents = new Map<string, AgentBreakerState>();
 
@@ -189,20 +197,47 @@ export class CircuitBreaker {
     if (s.compactingUntil > now) s.compactingUntil = now + POST_COMPACT_GRACE_MS;
   }
 
+  /** Stable, EXACT identity for a tool call.
+   *
+   *  This used to be `${name}:${JSON.stringify(toolInput).slice(0, 200)}` — a
+   *  PREFIX test, not an identity test. Two genuinely different calls whose
+   *  serialised form shares its first 200 characters produced the SAME key, so
+   *  the breaker counted distinct work as a loop. The 250-char per-string cap
+   *  made it strictly worse: two Write/Edit calls to one file that differ only
+   *  after character 250 collided by construction, and those are exactly the
+   *  calls that carry the most arguments.
+   *
+   *  Measured on the floor: an agent that had made THREE tool calls was reported
+   *  as "14× identical tool call", and one that had made ONE was reported as
+   *  "8×", against a limit of 8. The counter was not reaching 14 because 14
+   *  calls happened — it was reaching 14 because distinct calls collided.
+   *
+   *  Now the whole input is hashed, so identity is exact for any input. Values
+   *  are digested one at a time and folded together, so a multi-MB Write body is
+   *  hashed in place and the multi-MB intermediate string the old replacer was
+   *  written to avoid never gets materialised. Keys are sorted so argument
+   *  ORDER cannot change the identity of the same call. */
   private toolKey(toolName: string | undefined, toolInput: unknown): string {
-    // Truncating replacer: a Write/Edit tool_input carries the whole file body
-    // (up to MBs), and this runs synchronously inside the hook reply path on
-    // EVERY PostToolUse — serializing it all only to keep 200 chars was a
-    // multi-MB transient allocation per large write. Capping each string field
-    // bounds the work while keeping the key semantics (a repeat of the same
-    // call still yields the same key; distinct calls still differ within the
-    // first 200 chars far more often than full serialization ever mattered).
-    let inp = '';
+    const h = createHash('sha256');
     try {
-      inp = JSON.stringify(toolInput, (_k, v) =>
-        typeof v === 'string' && v.length > 250 ? v.slice(0, 250) : v) ?? '';
-    } catch { inp = String(toolInput); }
-    return `${toolName ?? '?'}:${inp.slice(0, 200)}`;
+      if (toolInput && typeof toolInput === 'object' && !Array.isArray(toolInput)) {
+        const rec = toolInput as Record<string, unknown>;
+        for (const k of Object.keys(rec).sort()) {
+          const v = rec[k];
+          h.update(k);
+          h.update('\u0000');
+          // Hash strings directly — JSON.stringify would copy the whole value.
+          h.update(typeof v === 'string' ? v : safeStringify(v));
+          h.update('\u0001');
+        }
+      } else {
+        h.update(typeof toolInput === 'string' ? toolInput : safeStringify(toolInput));
+      }
+    } catch {
+      // An exotic getter must not break the key, and must not be silent either.
+      h.update(safeStringify(toolInput));
+    }
+    return `${toolName ?? '?'}:${h.digest('hex').slice(0, 16)}`;
   }
 
   // ── periodic evaluation (called by the heartbeat beat) ────────────────────
