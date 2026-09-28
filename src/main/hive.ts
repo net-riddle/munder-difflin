@@ -1764,7 +1764,20 @@ export class HiveManager {
     try {
       // A fresh seed is ~90 chars (one header line + the prompt). Anything
       // meaningfully longer means the agent appended durable facts.
-      return readFileSync(p, 'utf8').trim().length > 200;
+      //
+      // Size, not content. This used to be
+      //   readFileSync(p, 'utf8').trim().length > 200
+      // which read the ENTIRE memory.md and then built a second full copy via
+      // .trim(), purely to answer a >200 question that statSync answers for
+      // free. It runs for every registered agent, archived included, from
+      // hive:agentDirectory — so the waste scales with the floor's total memory.
+      // Measured on this hive: 419,908 bytes read and discarded per call
+      // (247,424 + 104,778 + 67,706), growing every session.
+      //
+      // Bytes rather than characters is deliberate and harmless here: the test
+      // is a coarse "longer than the seed" probe, and for any real memory.md
+      // the two differ by well under the threshold's margin.
+      return statSync(p).size > 200;
     } catch { return false; }
   }
   inbox(id: string): HiveMessage[] {
