@@ -328,7 +328,16 @@ export class CircuitBreaker {
   ): { tripping: boolean; reason: string } {
     // (b) repeated identical tool calls
     if (s.repeatCount >= cfg.repeatedToolLimit) {
-      return { tripping: true, reason: `looping: ${s.repeatCount}× identical tool call (${s.repeatKey?.split(':')[0] ?? '?'})` };
+      // Print the WHOLE key, not just the tool name. The old form interpolated
+      // `s.repeatKey?.split(':')[0]`, i.e. the tool name alone, which discarded
+      // the entire args half of the comparison before the operator ever saw it.
+      // That is the sole reason an entire floor concluded the breaker "counts
+      // the tool, not the command" and built a theory on it: it always compared
+      // args, and the message made the claim impossible to falsify from the
+      // outside. With toolKey now an exact digest, the suffix is a real
+      // fingerprint — an operator can see the calls were byte-identical, and a
+      // collision would be visible as a digest that never settles.
+      return { tripping: true, reason: `looping: ${s.repeatCount}× identical tool call (${s.repeatKey ?? '?'})` };
     }
     // (b) api_error storm
     if (s.errorCount >= cfg.errorStormLimit) {
