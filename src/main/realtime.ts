@@ -69,41 +69,33 @@ const MAX_SPEAK_CHARS = 2_000;
  *  misconfigured endpoint (an HTML error page, a directory listing). */
 const MAX_SPEAK_BYTES = 15 * 1024 * 1024;
 
-/** Floor of the synthesis budget. A two-word line still needs the server to warm
- *  up and to actually generate: the same server, driven by the voice-outbox
- *  script, took **31.3 s** of wall clock to speak a one-sentence briefing. */
-const SPEAK_BUDGET_FLOOR_MS = 60_000;
-/** Per character, above the floor. From **197.7 s for 464 characters** measured
- *  end to end on that same server. That figure INCLUDES playback, so used as a
- *  synthesis budget it errs on the generous side — which is the safe direction
- *  for a timeout: waiting longer than needed costs a pause, cutting short costs
- *  the user the sentence. */
-const SPEAK_BUDGET_PER_CHAR_MS = 500;
-/** Ceiling. Past ten minutes something is wrong that waiting will not fix, and a
- *  message that takes that long to speak is its own defect. */
-const SPEAK_BUDGET_CEILING_MS = 600_000;
+/**
+ * The synthesis budget, loaded from disk rather than defined here.
+ *
+ * The voice-outbox script speaks through the same server and has to be given the
+ * same ceiling, or the two routes drift and nobody notices: that is exactly what
+ * happened — the app had a timeout, the script had none, and the divergence was
+ * invisible. Node cannot import TypeScript (measured on 23.4.0), so the shared
+ * policy has to be a plain `.cjs`; a `.mjs` can take a named import from one.
+ *
+ * Same shape as `kg-core.cjs`: a runtime `require`, a typed local assertion, and
+ * a copy step in `tools/copy-main-assets.cjs` so the packaged build has it.
+ */
+const { speakBudgetMs } = require('./tts-budget.cjs') as {
+  speakBudgetMs: (chars: number) => number;
+};
 
 /**
  * How long to wait for the local TTS server, as a function of the work asked for.
  *
- * This used to be a flat `SPEAK_TIMEOUT_MS` of 20 s, and that is the actual cause
- * of the announcement timeouts — not the `start` branch. A flat number cannot be
- * right for a generator whose cost grows with the text: measured on the same
- * server, a one-sentence briefing took 31.3 s of wall clock and a 464-character
- * message took 197.7 s. Both are above 20 s, so both would be reported as
- * `TTS request timed out` while the server was doing exactly what it was asked.
- *
- * The numbers above are measured, and the direction of their error is stated.
- * What is NOT measured is how much of those wall clocks was synthesis rather than
- * playback — the script that produced them has no split timer — so this budget is
- * an upper bound on synthesis, not an estimate of it.
+ * The old flat `SPEAK_TIMEOUT_MS` of 20 s was the actual cause of the
+ * announcement timeouts — not the `start` branch. A flat number cannot be right
+ * for a generator whose cost grows with the text: on the same server a
+ * one-sentence briefing took 31.3 s of wall clock and a 464-character message
+ * took 197.7 s, so both were reported as `TTS request timed out` while the
+ * server was doing exactly what it was asked. The numbers and the direction of
+ * their error now live with the function, in `tts-budget.cjs`.
  */
-export function speakBudgetMs(chars: number): number {
-  const n = Math.max(0, Math.min(MAX_SPEAK_CHARS, Number(chars) || 0));
-  const want = SPEAK_BUDGET_FLOOR_MS + SPEAK_BUDGET_PER_CHAR_MS * n;
-  return Math.max(SPEAK_BUDGET_FLOOR_MS, Math.min(SPEAK_BUDGET_CEILING_MS, want));
-}
-
 export type SpeakResult =
   | { ok: true; audio: string; mime: string; bytes: number }
   | { ok: false; error: string; code?: string };
