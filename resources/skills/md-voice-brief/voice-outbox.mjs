@@ -830,11 +830,40 @@ export async function flushOne(outbox, name, { userData, fetchImpl, platform, cl
    * own outcome. One place, because a move without a receipt is the state this
    * card exists to remove — if any path can still produce one, the fix is not a
    * fix.
+   *
+   * ENOENT HERE IS NOT A FAILURE, and this is the whole card.
+   *
+   * The app runs a watcher that drains the SAME directory, and it runs this
+   * same file (the per-agent copies are byte-identical to the repository's —
+   * that is what test/voice-lane-copies.test.cjs now holds them to). So both
+   * drains speak the same envelope and both try to file it, and whichever loses
+   * the rename finds nothing. Before this, the loser threw, `main`'s catch
+   * printed "crashed", and the process exited 1 — AFTER the user had already
+   * heard the message. A successful delivery declared a crash, which is worse
+   * than an honest error: an honest error is learned and avoided, and a false
+   * one is learned to distrust, and the retry of a distrusting tool speaks the
+   * message twice.
+   *
+   * WHAT SEPARATES SUCCESS FROM LOSS IS THE RECEIPT, not the error code. The
+   * receipt is the evidence that the other drainer spoke it and filed it. So:
+   * ENOENT with a receipt beside it is success, and ENOENT WITHOUT one is a
+   * message that vanished with nothing to show for it — that one still throws,
+   * because it is the case this file must never paper over.
    */
   const deliver = (sub, receipt) => {
     const to = join(outbox, sub);
     mkdirSync(to, { recursive: true });
-    renameSync(src, join(to, name));
+    try {
+      renameSync(src, join(to, name));
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        const filed = join(to, receiptName(name));
+        if (existsSync(filed)) {
+          return { ok: true, path: filed, racedBy: 'other-drainer' };
+        }
+      }
+      throw e;
+    }
     const written = writeReceipt(to, name, { ...receipt, finishedAt: new Date(clock()).toISOString() });
     return written;
   };
@@ -965,7 +994,13 @@ export function describeFlush(r) {
     return s ? `, ${s}` : '';
   };
   if (r.ok) {
-    return { stream: 'stdout', text: `spoke ${r.name} (${r.chars} chars, ${plural(r.pieces)}${took(r.totalMs)}${perPiece(r.results)})\n` };
+    // When the app's watcher filed this envelope first, say so. The message WAS
+    // spoken by this process — the audio already reached the user — so this is
+    // not a failure line, and it stays on stdout. But it is not silence either:
+    // two drains of one queue is a fact somebody has to be able to see, and the
+    // receipt that proves it belongs to the other drainer.
+    const raced = r.receipt && r.receipt.racedBy ? ' (the app watcher filed it first)' : '';
+    return { stream: 'stdout', text: `spoke ${r.name} (${r.chars} chars, ${plural(r.pieces)}${took(r.totalMs)}${perPiece(r.results)})${raced}\n` };
   }
   if (r.queued) {
     // Not spoken and not failed. Say so in those words, and still fail the exit

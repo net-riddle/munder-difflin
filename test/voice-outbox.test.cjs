@@ -998,3 +998,110 @@ test('005: one piece is not broken down into a breakdown of one', () => {
   const line = mod.describeFlush({ name: 'm.json', chars: 40, pieces: 1, spoken: 1, results: [{ piece: 1, of: 1, ms: 3100 }], totalMs: 3100, ok: true });
   assert.equal(line.text, 'spoke m.json (40 chars, 1 piece, 3.1 s)\n');
 });
+
+/* ------------------------------------------------------------------ *
+ * 083 — the drain that lies about success.
+ *
+ * The app runs a watcher over the same queue and it runs THIS SAME FILE, so both
+ * drains speak an envelope and both file it, and the loser of the rename finds
+ * nothing. Before, the loser threw ENOENT, main's catch printed "crashed" and
+ * the process exited 1 — after the human had already heard the message.
+ *
+ * The two cases below look identical from the losing side: the envelope is gone
+ * either way. What separates them is the RECEIPT, because the receipt is the
+ * evidence that somebody spoke it and filed it. These are simulated through the
+ * `playImpl` seam, which is where the race really happens: the other drainer
+ * moves the envelope while this process is still playing audio.
+ * ------------------------------------------------------------------ */
+
+function raceFixture(id) {
+  const { mkdtempSync, writeFileSync, mkdirSync, renameSync, existsSync, readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'vo-083-'));
+  const name = `msg-${id}.json`;
+  mkdirSync(join(dir, '.done'), { recursive: true });
+  writeFileSync(join(dir, name), JSON.stringify({ v: 1, id: `msg-${id}`, text: 'Una frase che l\'umano sentira.', createdAt: 'now' }), 'utf8');
+  return {
+    dir, name,
+    // `withReceipt` is the whole experiment: true = the other drainer finished
+    // the job properly, false = it took the envelope and left nothing behind.
+    otherDrainer: (withReceipt) => async () => {
+      renameSync(join(dir, name), join(dir, '.done', name));
+      if (withReceipt) {
+        writeFileSync(join(dir, '.done', mod.receiptName(name)),
+          JSON.stringify({ outcome: 'played', chars: 33, pieceCount: 1, spokenCount: 1 }), 'utf8');
+      }
+      return { ok: true };
+    },
+    doneReceipt: () => join(dir, '.done', mod.receiptName(name)),
+    hasReceipt: () => existsSync(join(dir, '.done', mod.receiptName(name))),
+    hasEnvelope: () => existsSync(join(dir, name)),
+    readReceipt: () => JSON.parse(readFileSync(join(dir, '.done', mod.receiptName(name)), 'utf8'))
+  };
+}
+
+test('083: ENOENT on the rename is SUCCESS when the other drainer left a receipt', async () => {
+  const f = raceFixture('raced');
+  const r = await mod.flushOne(f.dir, f.name, {
+    userData: f.dir, platform: 'win32', playImpl: f.otherDrainer(true),
+    fetchImpl: async () => new Response(realWav(), { status: 200 }), budgetMs: 5000
+  });
+
+  // The decisive assertion is `ok`, not the absence of a throw: this process
+  // DID speak the message, so reporting failure is what caused the double-send.
+  assert.equal(r.ok, true, 'a delivery that reached the user is not a failure');
+  assert.equal(r.receipt.ok, true);
+  assert.equal(r.receipt.racedBy, 'other-drainer', 'and it says who actually filed it');
+  assert.equal(f.hasReceipt(), true, 'the receipt is the evidence, and it is still there');
+
+  // The line must still open with `spoke`, and must name the race rather than
+  // hide it: two drains of one queue is a fact somebody has to be able to see.
+  const line = mod.describeFlush(r);
+  assert.equal(line.stream, 'stdout', 'success stays on stdout — it is not a warning');
+  assert.match(line.text, /^spoke msg-raced\.json/, 'never `crashed`, never `FAILED`');
+  assert.match(line.text, /app watcher filed it first/, 'and the race is visible, not silent');
+});
+
+test('083: ENOENT on the rename with NO receipt is still a loss, and stays red', async () => {
+  // THE CASE THAT MUST NOT BE PAPERED OVER. Identical from this side — the
+  // envelope is gone — but now nothing proves it was ever spoken. A guard that
+  // treated both as success would announce a delivery nobody can verify, which
+  // is the same class of lie in the opposite direction.
+  const f = raceFixture('lost');
+  await assert.rejects(
+    () => mod.flushOne(f.dir, f.name, {
+      userData: f.dir, platform: 'win32', playImpl: f.otherDrainer(false),
+      fetchImpl: async () => new Response(realWav(), { status: 200 }), budgetMs: 5000
+    }),
+    (e) => e.code === 'ENOENT',
+    'an envelope that vanished with no receipt must throw, not report success'
+  );
+  assert.equal(f.hasReceipt(), false, 'and the premise: there really is no receipt');
+  assert.equal(f.hasEnvelope(), false, 'the envelope really is gone');
+});
+
+test('083: the guard is the RECEIPT, not the error code — same ENOENT, both ways', async () => {
+  // One assertion holding the two tests together: identical failure, opposite
+  // verdicts, decided by one file on disk. If someone ever "simplifies" the
+  // check into catching ENOENT outright, this is what notices.
+  const raced = raceFixture('pair-a');
+  const ok = await mod.flushOne(raced.dir, raced.name, {
+    userData: raced.dir, platform: 'win32', playImpl: raced.otherDrainer(true),
+    fetchImpl: async () => new Response(realWav(), { status: 200 }), budgetMs: 5000
+  });
+  const lost = raceFixture('pair-b');
+  let threw = false;
+  try {
+    await mod.flushOne(lost.dir, lost.name, {
+      userData: lost.dir, platform: 'win32', playImpl: lost.otherDrainer(false),
+      fetchImpl: async () => new Response(realWav(), { status: 200 }), budgetMs: 5000
+    });
+  } catch { threw = true; }
+  assert.equal(ok.ok, true, 'receipt present -> success');
+  assert.equal(threw, true, 'receipt absent -> error');
+  // The pairing IS the claim: ONE failure, two opposite verdicts. Asserted as a
+  // pair so that changing BOTH branches to the same answer fails here, which is
+  // the mistake this test exists to catch.
+  assert.equal(ok.ok && threw, true, 'same ENOENT, opposite verdicts, decided by the receipt alone');
+});
