@@ -873,10 +873,31 @@ export function writtenMarkerPath(outbox, name) {
  * take a message it cannot account for, and the half-written temp file is
  * removed rather than left for the next reader to interpret.
  */
-export function queueMessage(outbox, text, { now = () => new Date().toISOString() } = {}) {
+export function queueMessage(outbox, text, { by = '', now = () => new Date().toISOString() } = {}) {
   const at = now();
   const id = `msg-${Date.now()}-${randomUUID().slice(0, 8)}`;
   const env = { v: 1, id, text: normalizeSpoken(text), createdAt: at };
+  // 097: WHO SENT IT, in the envelope, and only here.
+  //
+  // Measured before this line, on the real file: the envelope had no author, the
+  // `.written/` trace had no author, and the receipt had no `who`. So the question
+  // "who spoke" had never been written down anywhere — which is why nobody can
+  // tell today whether two voices overlapped, or which agent has been silent.
+  // A turn registry built by READING the records would have had nothing to read:
+  // a register nobody has ever filled in is not an empty register, it is a
+  // register that was never written.
+  //
+  // So the author goes where the message is born, once, and the receipt inherits
+  // it. No second book: two files recording the same fact is a book that
+  // contradicts itself, and a book that contradicts itself gets cited when it is
+  // convenient and ignored when it is not.
+  //
+  // ABSENT IS LEGAL and means what it says: `--write` from a human is not an
+  // agent. A delivery with no author is a third case, and it is recorded as one
+  // rather than guessed at — attributing a silence to somebody at random is worse
+  // than admitting there is no somebody.
+  const autore = String(by ?? '').trim();
+  if (autore) env.by = autore;
   const name = `${id}.json`;
   mkdirSync(outbox, { recursive: true });
   const tmp = join(outbox, `.${id}.tmp`);
@@ -886,7 +907,7 @@ export function queueMessage(outbox, text, { now = () => new Date().toISOString(
     mkdirSync(join(outbox, WRITTEN_DIR), { recursive: true });
     writeFileSync(
       marker,
-      JSON.stringify({ v: 1, envelope: name, id, writtenAt: at, chars: env.text.length }, null, 2),
+      JSON.stringify({ v: 1, envelope: name, id, writtenAt: at, chars: env.text.length, ...(autore ? { by: autore } : {}) }, null, 2),
       'utf8'
     );
   } catch (e) {
@@ -1248,6 +1269,13 @@ export async function flushOne(outbox, name, { userData, fetchImpl, platform, cl
       playMs: results.reduce((a, r) => a + r.playMs, 0),
     };
     const receiptBody = {
+      // 097: `who` is the ONE field that turns a delivery into a turn. It is
+      // carried from the envelope, and it is `''` when there was no author — which
+      // is a fact about that delivery, not a missing value, so the empty string is
+      // written rather than the key being left out. A record that omits the field
+      // cannot be told apart from a record made before this field existed, and
+      // those two are different histories.
+      who: (env.by ?? '').trim(),
       outcome, chars: summary.chars, pieceCount: summary.pieces, spokenCount: summary.spoken,
       startedAt: summary.startedAt, totalMs, synthMs: summary.synthMs, playMs: summary.playMs,
       pieces: results.map(shape),
@@ -1285,6 +1313,183 @@ export async function flushOne(outbox, name, { userData, fetchImpl, platform, cl
   }
 }
 
+/**
+ * How long an agent may go without speaking before the semaphore says so out loud.
+ *
+ * DECLARED, not derived, because there is nothing to derive it from: the floor has
+ * no history of voices yet (the 097 measured 0 receipts, 0 envelopes, 0 claims).
+ * An hour is long enough that a single exchange never trips it and short enough
+ * that a silent agent is visible within one working day.
+ *
+ * And it is a FACT TO SAY, not a fault to correct: the rule is «prendere il tempo»,
+ * not «non stare fermi». Two different constraints, and one semaphore cannot carry
+ * both — this one reports, it never blocks anybody from working.
+ */
+export const SILENCE_MS = 60 * 60 * 1000;
+
+/**
+ * Every completed delivery, oldest first — THE TURN REGISTRY, and it is a READ.
+ *
+ * There is no turn file: the receipt already is the record of who spoke, when, for
+ * how long and which message, so the registry is those receipts in order. A second
+ * file recording the same facts would be a second book, and a second book is
+ * contradicted the first time one of the two is written and not the other.
+ *
+ * A receipt carrying `racedBy` is skipped: that one was written by the OTHER
+ * drainer, and counting it here would say an agent spoke when the agent whose
+ * message it was had its claim decided before the first word.
+ */
+export function turnsFrom(outbox) {
+  const done = join(outbox, '.done');
+  let names;
+  try { names = readdirSync(done); } catch { return []; }
+  const turns = [];
+  for (const f of names) {
+    if (!f.endsWith(RECEIPT_SUFFIX)) continue;
+    let r;
+    try { r = JSON.parse(readFileSync(join(done, f), 'utf8')); } catch { continue; }
+    if (!r || r.racedBy) continue;
+    const at = Date.parse(r.finishedAt || r.startedAt || '');
+    if (!Number.isFinite(at)) continue;
+    turns.push({
+      envelope: r.envelope || f.slice(0, -RECEIPT_SUFFIX.length) + '.json',
+      who: String(r.who ?? '').trim(),
+      at,
+      ms: Number.isFinite(r.totalMs) ? r.totalMs : 0,
+      outcome: r.outcome ?? null,
+    });
+  }
+  return turns.sort((a, b) => a.at - b.at || a.envelope.localeCompare(b.envelope));
+}
+
+/**
+ * `chiDeveParlare`: the agent that has gone LONGEST without being spoken, first.
+ *
+ * NOT the busiest, and NOT the last in the queue. The card writes the criterion
+ * down because implementing it as "the last one in" is the same defect wearing a
+ * rule's clothes: a loud agent would keep winning and a quiet one would never be
+ * reached, and the rule would still read like fairness.
+ *
+ * AN AGENT WHO HAS NEVER SPOKEN IS THE QUIETEST OF ALL, so `waitedMs` is
+ * `Infinity` for it — and the comparison is strict `>`, which means a tie between
+ * two never-spoken agents is settled by the order they were given in, not by a
+ * comparison between two infinities that can never succeed. That determinism is
+ * deliberate: a tie that silently picks by object order is a rule nobody wrote.
+ */
+export function chiDeveParlare(outbox, agents, { turns, now = Date.now, escluso = '' } = {}) {
+  const elenco = [...new Set((agents || []).map((a) => String(a ?? '').trim()).filter(Boolean))]
+    // 097: THE AGENT THAT IS SPEAKING IS NOT THE NEXT ONE. `turnsFrom` reads the
+    // receipts in `.done/`, so a delivery in flight is not a turn yet — which made
+    // the agent holding the live claim look like it had NEVER spoken, and the
+    // semaphore then named the speaker as both "speaking now" and "who is next".
+    // Found by RUNNING the semaphore, not by reading it: a line that reports two
+    // contradictory facts about one agent is worse than no line, because it is
+    // plausible.
+    .filter((a) => a !== String(escluso ?? '').trim());
+  if (!elenco.length) return null;
+  const at = now();
+  const ultimo = new Map(elenco.map((a) => [a, null]));
+  for (const t of (turns || turnsFrom(outbox))) {
+    if (ultimo.has(t.who)) ultimo.set(t.who, t.at);
+  }
+  let best = null;
+  for (const who of elenco) {
+    const last = ultimo.get(who);
+    const waitedMs = last === null ? Infinity : at - last;
+    if (!best || waitedMs > best.waitedMs) best = { who, waitedMs, never: last === null };
+  }
+  return best;
+}
+
+/**
+ * Is somebody speaking RIGHT NOW, and since when.
+ *
+ * A live claim is a receipt in `.claim/` whose `renewedAt` is inside the window,
+ * so "speaking now" is read from the same fact the claim is: the process is alive
+ * and renewing. `da quanto` is measured from `renewedAt`, the last proof of life,
+ * not from `claimedAt`: a long message looks longer than it is if you measure
+ * from when it started.
+ *
+ * THE AUTHOR IS READ FROM THE ENVELOPE BESIDE IT, and not from the claim receipt,
+ * for a reason that is a rule rather than a convenience: the claim receipt is
+ * written IMMEDIATELY after the rename, before the envelope is even read, because
+ * a claim without a receipt is an envelope no reader can ever find again. So the
+ * author is not knowable at that instant, and the only honest place to read it is
+ * the file that is still there.
+ */
+export function activeClaim(outbox, { now = Date.now, windowMs = CLAIM_WINDOW_MS } = {}) {
+  const dir = join(outbox, CLAIM_DIR);
+  let names;
+  try { names = readdirSync(dir); } catch { return null; }
+  const at = now();
+  let best = null;
+  for (const f of names) {
+    if (!f.endsWith(RECEIPT_SUFFIX)) continue;
+    let r;
+    try { r = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch { continue; }
+    const renewed = Date.parse(r.renewedAt || r.claimedAt || '');
+    if (!Number.isFinite(renewed)) continue;
+    if (at - renewed > windowMs) continue;          // expired: it is a recovery, not a speaker
+    const name = f.slice(0, -RECEIPT_SUFFIX.length) + '.json';
+    let who = '';
+    try { who = String((JSON.parse(readFileSync(join(dir, name), 'utf8')) || {}).by ?? '').trim(); } catch { /* envelope gone: unknown, and unknown is not guessed */ }
+    const heldMs = at - renewed;
+    if (!best || heldMs < best.heldMs) best = { envelope: name, who, heldMs, claimedAt: r.claimedAt ?? null };
+  }
+  return best;
+}
+
+/**
+ * THE SEMAPHORE — one line, for a human, because one line gets read.
+ *
+ * `PARLA` (red) somebody is speaking, with how long. `IN CODA` (yellow) the queue
+ * has work and names who is next. `LIBERO` (green) nothing to say.
+ *
+ * Silence is REPORTED, never corrected: an agent past `SILENCE_MS` is named in the
+ * line as a fact, and nothing here stops it from working, because «prendere il
+ * tempo» and «non stare fermi» are two different rules and one line cannot enforce
+ * both.
+ */
+export function semaforo(outbox, agents, { turns, now = Date.now, windowMs = CLAIM_WINDOW_MS, silenceMs = SILENCE_MS } = {}) {
+  const at = now();
+  const coda = pending(outbox);
+  const reg = turns || turnsFrom(outbox);
+  const attivo = activeClaim(outbox, { now: () => at, windowMs });
+  const chiParla = attivo ? attivo.who : '';
+  const prossimo = chiDeveParlare(outbox, agents, { turns: reg, now: () => at, escluso: chiParla });
+
+  const silenziosi = (agents || [])
+    .map((a) => String(a ?? '').trim())
+    .filter(Boolean)
+    // …and the agent holding the live claim is not silent either. It is talking.
+    .filter((a) => a !== chiParla)
+    .map((a) => {
+      const last = [...reg].reverse().find((t) => t.who === a);
+      return { a, waitedMs: last ? at - last.at : Infinity, never: !last };
+    })
+    .filter((x) => x.waitedMs > silenceMs)
+    .sort((x, y) => y.waitedMs - x.waitedMs);
+
+  const fmt = (ms) => (ms === Infinity ? 'mai' : ms < 60000 ? `${Math.round(ms / 1000)} s` : `${Math.round(ms / 60000)} min`);
+  const chi = (x) => (!x ? 'nessuno' : x.never ? `${x.who} (non ha mai parlato, ${fmt(x.waitedMs)})` : `${x.who} (${fmt(x.waitedMs)} fa)`);
+  const muti = silenziosi.length ? ` | senza voce da: ${silenziosi.slice(0, 4).map((x) => `${x.a} ${x.never ? 'mai' : fmt(x.waitedMs)}`).join(', ')}` : '';
+
+  if (attivo) {
+    return `PARLA | ${attivo.who || 'senza autore'} da ${fmt(attivo.heldMs)} (${attivo.envelope}) | prossimo: ${chi(prossimo)} | in coda: ${coda.length}${muti}`;
+  }
+  if (coda.length) {
+    return `IN CODA | ${coda.length} ${coda.length === 1 ? 'messaggio' : 'messaggi'} | prossimo: ${chi(prossimo)}${muti}`;
+  }
+  // The idle line names the next agent too, and that is not decoration: the human
+  // asking this question is asking "is it my turn?", and the honest answer while
+  // nothing is queued is still WHICH agent the queue will reach first. A line that
+  // only answered it when there was work would answer it exactly when it does not
+  // matter.
+  return `LIBERO | niente in coda | prossimo: ${chi(prossimo)} | ultimo turno: ${reg.length ? chi({ who: reg[reg.length - 1].who, waitedMs: at - reg[reg.length - 1].at, never: !reg[reg.length - 1].who }) : 'nessuno registrato'}${muti}`;
+}
+
+
+
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 const USAGE = `voice-outbox — queue and play a spoken message for Munder Difflin
@@ -1295,6 +1500,8 @@ const USAGE = `voice-outbox — queue and play a spoken message for Munder Diffl
   --check-file f     check the text in a file
   --flush            speak everything queued, oldest first
   --list             list what is queued, with its state
+  --semaforo         the line a human reads: who is speaking, who is next, who is silent
+  --agent <id>       declare the author of the next --write (turns and fairness need it)
   --outbox <dir>     override the queue directory
 
 Reads the TTS URL, model, voice and speed from the app's config.json, so a
@@ -1424,6 +1631,28 @@ async function main(argv) {
       }
       process.stdout.write(`${n}  ${note}\n`);
     }
+    return 0;
+  }
+
+  // 097: THE SEMAPHORE IS A VERB, not a thing you read in a file. The card puts
+  // it exactly right: to find out whether it is your turn you would have to open a
+  // file, and a thing you have to open is an archive. One line, on request.
+  if (argv.includes('--semaforo')) {
+    const chiSono = arg('--agenti');
+    let agents = [];
+    if (chiSono) {
+      agents = chiSono.split(',').map((s) => s.trim()).filter(Boolean);
+    } else {
+      // With no --agents, the authors that the receipts already know about, plus
+      // anyone with something queued. Derived from the records, so the line can
+      // never name an agent the floor has never seen.
+      const visti = new Set(turnsFrom(outbox).map((t) => t.who).filter(Boolean));
+      for (const n of pending(outbox)) {
+        try { const b = (JSON.parse(readFileSync(join(outbox, n), 'utf8')) || {}).by; if (b) visti.add(String(b)); } catch { /* unreadable: no claim */ }
+      }
+      agents = [...visti];
+    }
+    process.stdout.write(semaforo(outbox, agents) + '\n');
     return 0;
   }
 
