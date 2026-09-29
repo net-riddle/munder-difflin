@@ -299,6 +299,64 @@ export function redactSecrets(text: unknown): string {
  *  SYSTEM_SENDERS and would otherwise be counted as actionable mail forever. */
 export const UNDELIVERABLE_MARKER = '[undeliverable';
 
+/** Levenshtein, on characters. Small inputs only — an id is a dozen characters. */
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, i) => i);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+/**
+ * The id you probably meant, or `null`.
+ *
+ * 094: a refusal that does not say the answer is half the work, and the half that
+ * is missing is exactly the half that helps whoever made the mistake. A
+ * transposition — `pam-mul0zyj` for `pam-mul0lzyj`, fourteen characters with two
+ * swapped — is the case that actually cost a message, and it is invisible without
+ * the suggestion: the two ids read as unrelated strings to a tired eye.
+ *
+ * **TWO EDITS, and not one char more, and the reason is that a wrong suggestion
+ * is worse than none.** A threshold of 3 starts matching ids that share a common
+ * prefix, and a message that says «did you mean kelly-multwfg2?» when the sender
+ * meant nothing of the sort teaches people to ignore the line. *Attributing a
+ * silence to somebody at random is worse than admitting there is nobody — and the
+ * same holds for a hint.* So: at most two edits, ties named together, and `null`
+ * when nothing is close.
+ */
+export function nearestAgentId(misspelled: string, ids: string[], maxEdits = 2): string | null {
+  const want = String(misspelled ?? '').trim().toLowerCase();
+  if (!want) return null;
+  const scored = [...new Set(ids.map((i) => String(i ?? '').trim()).filter(Boolean))]
+    .filter((i) => i.toLowerCase() !== want)
+    .map((id) => ({ id, d: editDistance(want, id.toLowerCase()) }))
+    .sort((x, y) => x.d - y.d || x.id.localeCompare(y.id));
+  if (!scored.length || scored[0].d > maxEdits) return null;
+  const best = scored.filter((s) => s.d === scored[0].d).map((s) => s.id);
+  return best.length === 1 ? best[0] : best.slice(0, 3).join(' / ');
+}
+
+/** The sentence a refusal ends with: the near-miss, or an honest "there is none". */
+export function undeliverableReason(target: string, ids: string[]): string {
+  const near = nearestAgentId(target, ids);
+  return near
+    ? `no agent "${target}" on this floor; the closest is "${near}" — check the id against the roster`
+    : `no agent "${target}" on this floor; check the id against the roster`;
+}
+
 export class HiveManager {
   /**
    * @param getHome  Lazily resolve harnessHome so the hive follows config changes.
@@ -1590,7 +1648,25 @@ export class HiveManager {
       // delivery failure with neither bounce nor log, so the sender saw a routed
       // message and the mail simply ceased to exist. Record the drop beside the
       // hop-cap one and bounce to god, mirroring the undeliverable bounces above.
-      this.appendLog({ kind: 'drop', reason: 'no-inbox', from: msg.from, to: t, id: msg.id });
+      //
+      // 094: THE BOUNCE TO GOD IS NOT ENOUGH, and it took two lost messages to
+      // measure why. God learns that a message failed; the SENDER learns nothing,
+      // because the only trace of a mis-addressed message lands in somebody
+      // else's inbox. That is why this went unnoticed twice on one floor: the
+      // coordinator heard about it, so the floor looked covered, and the person
+      // who typed the wrong id was never told. *A refusal that reaches the
+      // coordinator is a report, not a reply.*
+      //
+      // So the sender is told too, in the one place they already look: their own
+      // inbox. And the refusal NAMES THE NEAR MISS, because `pam-mul0zyj` and
+      // `pam-mul0lzyj` are two unrelated-looking strings and a human who is told
+      // only that the id is wrong still has to find the typo themselves.
+      const vicino = nearestAgentId(t, Object.keys(reg.agents ?? {}));
+      this.appendLog({
+        kind: 'drop', reason: 'no-inbox', from: msg.from, to: t, id: msg.id,
+        ...(vicino ? { nearest: vicino } : {}), toldSender: msg.from !== godId && existsSync(join(this.agentDir(msg.from), 'inbox'))
+      });
+      const motivo = undeliverableReason(t, Object.keys(reg.agents ?? {}));
       if (t !== godId) {
         this.deliver({
           ...msg,
@@ -1601,8 +1677,24 @@ export class HiveManager {
           // So a reply to an id that is not on the floor could bounce forever,
           // completely uncapped, reusing the original msg.id each time.
           hops: (msg.hops ?? 0) + 1,
-          subject: `[undeliverable — no agent "${t}" on this floor; check the id against the roster] ${msg.subject}`
+          subject: `[undeliverable — ${motivo}] ${msg.subject}`
         }, godId);
+        // …and the same sentence, into the sender's own inbox, with no body change
+        // so the original text is still there to read.
+        if (msg.from !== godId && existsSync(join(this.agentDir(msg.from), 'inbox'))) {
+          this.deliver({
+            ...msg,
+            from: godId,
+            act: 'inform',
+            to: msg.from,
+            hops: (msg.hops ?? 0) + 1,
+            // `UNDELIVERABLE_MARKER` already carries its own bracket, so the
+            // template must not add a second: `[undeliverable — …]`, not
+            // `[[undeliverable — …]`. A doubled bracket is a marker a reader
+            // learns to skip, which is the opposite of what a marker is for.
+            subject: `${UNDELIVERABLE_MARKER} — your message "${msg.subject}" was NOT delivered; ${motivo}]`
+          }, msg.from);
+        }
       }
     }
     this.appendLog({ kind: 'message', from: msg.from, to: msg.to, act: msg.act, subject: msg.subject, id: msg.id, delivered });
