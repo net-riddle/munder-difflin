@@ -53,12 +53,34 @@ you did about it, in that order.
 
 ## The three steps
 
+## Where the script lives, and why there is no copy of it here
+
+`voice-outbox.mjs` sits **in the repository**, at `resources/skills/md-voice-brief/voice-outbox.mjs`,
+and it is **not** copied into any agent's `.claude/skills/`. Run it from there.
+
+This is not tidiness. Copies of this file existed, they diverged, and the lane
+someone was listening to turned out to be a different program from the one in the
+repo — 720 lines without the splitter next to 1064 with it, and nothing said so.
+A private copy that looks like the real thing is worse than no copy, because
+nothing tells you which one you got. So there is one script, it is in the repo,
+and the ceiling it enforces (`src/main/tts-budget.cjs`, one policy for both
+speaking routes) is only reachable from there: a copy elsewhere cannot load it,
+and is meant to fail rather than quietly stop having a ceiling.
+
+Set the path once, then use it for all three steps:
+
+```bash
+VOICE_OUTBOX="<repo>/resources/skills/md-voice-brief/voice-outbox.mjs"
+```
+
+If you cannot find the repository, that is a question for god, not a guess.
+
 ### 1. Write it
 
 Keep the finished text in a variable, or a scratch file. Check it:
 
 ```bash
-node "$AGENT_DIR/.claude/skills/md-voice-brief/voice-outbox.mjs" --check "your message here"
+node "$VOICE_OUTBOX" --check "your message here"
 ```
 
 It prints `BLOCK [code] detail` for anything that will not survive being heard,
@@ -70,7 +92,7 @@ important part and let the rest live in the card.
 ### 2. Queue it
 
 ```bash
-node "$AGENT_DIR/.claude/skills/md-voice-brief/voice-outbox.mjs" --write "your message here"
+node "$VOICE_OUTBOX" --write "your message here"
 ```
 
 This re-checks, then writes an envelope to the queue and prints its path. The
@@ -79,7 +101,7 @@ message is **not spoken yet**.
 ### 3. Speak it
 
 ```bash
-node "$AGENT_DIR/.claude/skills/md-voice-brief/voice-outbox.mjs" --flush
+node "$VOICE_OUTBOX" --flush
 ```
 
 Speaks everything queued, oldest first, and moves each envelope to `.done/` — or

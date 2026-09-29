@@ -36,6 +36,18 @@
  * spoken lands in `.failed/` with the reason. A queue that deletes on failure
  * loses a message the user was told to expect, and nobody can tell it apart from
  * a queue that never ran.
+ *
+ * RECEIPT — the outcome, in a file beside the envelope
+ *
+ *   <userData>/voice-outbox/.done/<id>.receipt.json
+ *
+ * What happened to the message: pieces, how many sounded, the outcome and the
+ * seconds for EACH piece, and the totals. It is a sibling rather than a field
+ * because the envelope is a contract with whatever drains this queue next, and
+ * because a receipt written into the spoken text would be an announcement nobody
+ * authored. It also carries `finishedAt`, which is not a nicety: `rename`
+ * preserves mtime, so every envelope in `.done` still wears its own birth date
+ * and the one number that matters — when this was played — was on nobody's disk.
  */
 
 import { readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, existsSync, unlinkSync } from 'node:fs';
@@ -44,6 +56,20 @@ import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+
+// ONE synthesis budget, imported — not copied. This is the whole defect 003
+// exists to close, so the import is the fix and the rest of this card is wiring:
+// `src/main/realtime.ts` loads the same file, so the app's route and this route
+// cannot drift into different ceilings without a test noticing.
+//
+// It resolves from THIS file's location, which is `resources/skills/md-voice-brief/`
+// — three levels below the repo root. That path is only correct for the file where
+// it lives: a copy under `agents/<id>/.claude/skills/` has no `src/` above it, and
+// the import below is written to FAIL LOUDLY in that case rather than to fall back
+// to a local constant. A ceiling nobody can see, in a file nobody reads, on the
+// only route the user can hear, is worse than no file at all: it is the absence of
+// a ceiling, wearing the costume of one.
+import { speakBudgetMs } from '../../../src/main/tts-budget.cjs';
 
 // ─── limits ──────────────────────────────────────────────────────────────────
 
@@ -372,13 +398,35 @@ export function aggregateOutcome(results) {
  * that is `queued` (no playback implementation on this platform) DOES stop it,
  * because there is nothing to play and continuing would only burn the same
  * failure N more times.
+ *
+ * TIMING, and why it is split in two rather than reported as one number.
+ *
+ * Every run of this script used to be timed by a person with a stopwatch, three
+ * times, because nothing recorded it: the numbers that exist (31.3 s, 197.7 s,
+ * 204.2 s) are a hand measurement each, and the length-based estimate they are
+ * checked against is the only estimate there is. So each piece carries `synthMs`
+ * and `playMs` separately, and that separation is the whole point: `playMs` is
+ * how long the audio was audible, `synthMs` is how long the server took to make
+ * it, and only the first of those is time the human was made to wait through
+ * silence. One total would hide exactly the thing worth seeing — a piece that
+ * spent its time waiting on the server, not being heard.
+ *
+ * A failed piece is timed too, and split the same way: a piece that failed during
+ * synthesis has `playMs: 0` and a synth time worth looking at.
  */
-export async function speakPieces(pieces, { synth, play, onPiece } = {}) {
+export async function speakPieces(pieces, { synth, play, onPiece, now = () => performance.now() } = {}) {
   const results = [];
+  const ms = (from) => Math.max(0, Math.round(now() - from));
   for (let i = 0; i < pieces.length; i++) {
+    const t0 = now();
     const syn = await synth(pieces[i], i);
+    const tSynth = now();
     if (!syn || !syn.ok) {
-      results.push({ piece: i + 1, of: pieces.length, ok: false, stage: 'synthesize', error: (syn && syn.error) || 'synthesis failed' });
+      results.push({
+        piece: i + 1, of: pieces.length, ok: false, stage: 'synthesize',
+        error: (syn && syn.error) || 'synthesis failed',
+        synthMs: ms(t0), playMs: 0, ms: ms(t0),
+      });
       if (onPiece) onPiece(results[results.length - 1]);
       continue;
     }
@@ -386,11 +434,29 @@ export async function speakPieces(pieces, { synth, play, onPiece } = {}) {
     results.push({
       piece: i + 1, of: pieces.length, ok: !!played.ok,
       stage: played.ok ? 'played' : 'playback', error: played.error, queued: !!played.queued,
+      synthMs: Math.max(0, Math.round(tSynth - t0)),
+      playMs: Math.max(0, Math.round(now() - tSynth)),
+      ms: ms(t0),
     });
     if (onPiece) onPiece(results[results.length - 1]);
     if (played.queued) break;
   }
   return { outcome: aggregateOutcome(results), results };
+}
+
+/**
+ * A duration the way a person says it: milliseconds below a second, tenths above.
+ *
+ * `84.8 s` next to `84.76 s` is not pedantry, it is that a timing nobody can read
+ * is a timing nobody uses. And the sub-second case is not cosmetic either — a
+ * piece that reports `0.0 s` is indistinguishable from a piece whose clock never
+ * ran, which is a real failure mode of a broken measurement, so a real one is
+ * printed in the unit where it is still true.
+ */
+export function fmtMs(ms) {
+  if (ms == null || !Number.isFinite(ms)) return null;
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
 }
 
 
@@ -595,13 +661,36 @@ export function repairWav(buf, info) {
  * Non-2xx bodies are truncated to a line: a TTS server that is down answers with
  * an HTML error page or a stack trace, and the whole of it would bury the one
  * fact that matters (that the server is not reachable).
+ *
+ * THERE IS A CEILING, and it is the shared one. Before this, `synthesize()` waited
+ * on the server for as long as the server liked: the script route had no timeout
+ * at all while the app route had one, so the two could disagree about what "long"
+ * means and only one of them was on a clock. 064 then multiplied that unbounded
+ * wait by the number of pieces, so one stuck server cost N times forever.
+ *
+ * The budget is asked for the LENGTH OF THE PIECE, not of the message. That is not
+ * a detail: with the 220-character splitter a request is one piece, so the number
+ * in play is ~170 s at most — comfortably above the 204.2 s whole-message run the
+ * policy was calibrated from, and above the 16.9 s a 101-character piece actually
+ * took. A timeout has to be wrong in the direction of waiting too long: waiting
+ * costs the user a pause, giving up early costs them the sentence.
+ *
+ * WHAT A TIMEOUT LOOKS LIKE, and it is not optional: a piece that gives up is
+ * `stage: 'synthesize', ok: false`, `speakPieces` aggregates the WORST piece, so
+ * the envelope lands in `.failed` with the reason and the line says `FAILED`. It
+ * cannot print `spoke` and it cannot reach `.done` — that is the user's rule
+ * ("wait for delivery AND playback") already encoded in the aggregation, so
+ * wiring the error in is all this costs.
  */
-export async function synthesize(text, settings, fetchImpl = fetch) {
+export async function synthesize(text, settings, fetchImpl = fetch, budgetMs = speakBudgetMs(text.length)) {
   const base = String(settings.baseUrl || '').replace(/\/+$/, '');
   if (!/^https?:\/\//i.test(base)) {
     return { ok: false, error: `TTS base URL is not http(s): ${JSON.stringify(settings.baseUrl)}` };
   }
   const url = `${base}/audio/speech`;
+  const started = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), budgetMs);
   try {
     const res = await fetchImpl(url, {
       method: 'POST',
@@ -612,7 +701,8 @@ export async function synthesize(text, settings, fetchImpl = fetch) {
         voice: settings.voice,
         response_format: settings.format,
         speed: settings.speed
-      })
+      }),
+      signal: controller.signal
     });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
@@ -634,15 +724,51 @@ export async function synthesize(text, settings, fetchImpl = fetch) {
     const audio = info.needsRepair ? repairWav(buf, info) : buf;
     return { ok: true, audio, repaired: info.needsRepair };
   } catch (e) {
+    // The elapsed time and the budget are both in the message, and that is the
+    // point of it. The old error was the bare string 'TTS request timed out',
+    // written at the moment of giving up: with no start time kept, "needed 19.9 s"
+    // and "needed 169 s" were the same line, and the first one is indistinguishable
+    // from a ceiling that is set wrong.
+    const waited = Date.now() - started;
+    if (controller.signal.aborted) {
+      return { ok: false, error: `TTS request timed out after ${waited}ms (budget ${budgetMs}ms for ${text.length} chars)` };
+    }
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 // ─── the queue ───────────────────────────────────────────────────────────────
 
-/** Envelope filenames are `.json`; the three subdirs are ignored by `pending()`. */
+/**
+ * The receipt suffix: `<id>.receipt.json`, beside the envelope it describes.
+ *
+ * WHY A SECOND FILE AND NOT A FIELD IN THE ENVELOPE — the requirement is the
+ * opposite of what it looks like. An envelope is a contract with whatever drains
+ * the queue next: flat, versioned, text plus an optional voice, nothing else
+ * (`ENVELOPE` in the header). Writing the outcome into it makes the thing a
+ * speaker reads depend on a thing the executor wrote, and a receipt written
+ * into `text` is worse than no receipt — the human hears an announcement that
+ * says it was 84.8 seconds. So the envelope stays exactly as authored and stays
+ * readable, and the evidence lives next to it.
+ *
+ * WHY IT CANNOT BE `.`-PREFIXED: a dotfile is invisible to `readdirSync` for
+ * every reader that filters them, and `.done` is already a dotfile. A receipt
+ * named `.<id>.receipt.json` would be exactly as findable as the `.done`
+ * directory: not at all. The suffix is spelled out in `isEnvelopeFile` instead,
+ * which is the one place that has to agree.
+ */
+export const RECEIPT_SUFFIX = '.receipt.json';
+
+/** The receipt that belongs to envelope `name`, in the same directory. */
+export function receiptName(name) {
+  return name.replace(/\.json$/, '') + RECEIPT_SUFFIX;
+}
+
+/** Envelope filenames are `.json`; the three subdirs and the receipts are not. */
 function isEnvelopeFile(name) {
-  return name.endsWith('.json') && !name.startsWith('.');
+  return name.endsWith('.json') && !name.startsWith('.') && !name.endsWith(RECEIPT_SUFFIX);
 }
 
 /** Every envelope waiting to be spoken, oldest first by filename. */
@@ -657,30 +783,74 @@ export function pending(outbox) {
 }
 
 /**
+ * Write the outcome of one delivery beside its envelope, and never throw.
+ *
+ * WHY THIS EXISTS, measured: six envelopes went through this script in one
+ * evening and every one of them landed in `.done/` byte-identical to what was
+ * queued — same four fields, and an mtime equal to its own creation time, because
+ * `rename` preserves it. So the only proof anyone had was the console line of the
+ * terminal that happened to be running, and it said nothing about which piece
+ * played, which failed, or how long it took. A file that cannot say when something
+ * happened to it is not evidence of anything; this one can, which is why it
+ * carries `finishedAt` rather than trusting its own mtime.
+ *
+ * Best-effort on purpose. The audio has already been heard by the time this runs,
+ * so failing the delivery because the receipt could not be written would turn a
+ * recording problem into a delivery problem — and would take the envelope in
+ * `.done` back out of `.done`. So the error is returned to the caller and named on
+ * the printed line instead.
+ */
+export function writeReceipt(dir, name, receipt) {
+  const path = join(dir, receiptName(name));
+  const body = JSON.stringify({ v: 1, envelope: name, ...receipt }, null, 2);
+  const tmp = join(dir, `.${receiptName(name)}.tmp`);
+  try {
+    writeFileSync(tmp, body, 'utf8');
+    renameSync(tmp, path);
+    return { ok: true, path };
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+    return { ok: false, path, error: `could not write the receipt: ${e.message}` };
+  }
+}
+
+/**
  * Speak one envelope, moving it to `.done/` or `.failed/` afterwards.
  *
  * The move is the last thing that happens and it always happens: an envelope
  * that vanishes without a trace is a message the user was expecting and never
  * heard, with no evidence it ever existed.
  */
-export async function flushOne(outbox, name, { userData, fetchImpl, platform } = {}) {
+export async function flushOne(outbox, name, { userData, fetchImpl, platform, clock = Date.now, playImpl, budgetMs } = {}) {
   const src = join(outbox, name);
+  const startedAt = clock();
+
+  /**
+   * Move the envelope and leave a receipt beside it, then report the receipt's
+   * own outcome. One place, because a move without a receipt is the state this
+   * card exists to remove — if any path can still produce one, the fix is not a
+   * fix.
+   */
+  const deliver = (sub, receipt) => {
+    const to = join(outbox, sub);
+    mkdirSync(to, { recursive: true });
+    renameSync(src, join(to, name));
+    const written = writeReceipt(to, name, { ...receipt, finishedAt: new Date(clock()).toISOString() });
+    return written;
+  };
+
   let env;
   try {
     env = JSON.parse(readFileSync(src, 'utf8').replace(/^\uFEFF/, ''));
   } catch (e) {
-    const to = join(outbox, '.failed');
-    mkdirSync(to, { recursive: true });
-    renameSync(src, join(to, name));
-    return { ok: false, name, error: `envelope is not valid JSON: ${e.message}` };
+    const receipt = deliver('.failed', { outcome: 'rejected', stage: 'envelope', error: `envelope is not valid JSON: ${e.message}` });
+    return { ok: false, name, outcome: 'rejected', error: `envelope is not valid JSON: ${e.message}`, receipt };
   }
 
   const check = validateEnvelope(env);
   if (!check.ok) {
-    const to = join(outbox, '.failed');
-    mkdirSync(to, { recursive: true });
-    renameSync(src, join(to, name));
-    return { ok: false, name, error: check.problems.join('; ') };
+    const receipt = deliver('.failed', { outcome: 'rejected', stage: 'envelope', error: check.problems.join('; ') });
+    return { ok: false, name, outcome: 'rejected', error: check.problems.join('; '), receipt };
   }
 
   const settings = resolveTtsSettings(readConfig(userData), { voice: env.voice });
@@ -689,47 +859,70 @@ export async function flushOne(outbox, name, { userData, fetchImpl, platform } =
   // are only how the audio is delivered, so they never become N files.
   const pieces = splitForSpeech(spoken);
   if (pieces.length === 0) {
-    const to = join(outbox, '.failed');
-    mkdirSync(to, { recursive: true });
-    renameSync(src, join(to, name));
-    return { ok: false, name, error: 'nothing speakable to say' };
+    const receipt = deliver('.failed', { outcome: 'rejected', stage: 'text', error: 'nothing speakable to say' });
+    return { ok: false, name, outcome: 'rejected', error: 'nothing speakable to say', receipt };
   }
 
   const temps = [];
-  const file = (sub) => {
-    const to = join(outbox, sub);
-    mkdirSync(to, { recursive: true });
-    renameSync(src, join(to, name));
-  };
+  // `playImpl` is a seam, not a setting: with it, the `.done` branch — the one
+  // the receipt card is actually about — can be exercised without a speaker,
+  // which is the only way a receipt written there is ever tested rather than
+  // asserted about.
+  const play = playImpl || (async (syn) => {
+    const wav = join(tmpdir(), `md-voice-${randomUUID().slice(0, 8)}.wav`);
+    temps.push(wav);
+    writeFileSync(wav, syn.audio);
+    return playWavSync(wav, platform);
+  });
+  const shape = (piece) => ({
+    piece: piece.piece, of: piece.of, chars: pieces[piece.piece - 1].length,
+    ok: piece.ok, stage: piece.stage, error: piece.error ?? null,
+    synthMs: piece.synthMs, playMs: piece.playMs, ms: piece.ms,
+  });
 
   try {
     const { outcome, results } = await speakPieces(pieces, {
-      synth: async (piece) => synthesize(piece, settings, fetchImpl),
-      play: async (syn) => {
-        const wav = join(tmpdir(), `md-voice-${randomUUID().slice(0, 8)}.wav`);
-        temps.push(wav);
-        writeFileSync(wav, syn.audio);
-        return playWavSync(wav, platform);
-      },
+      synth: async (piece) => synthesize(piece, settings, fetchImpl, budgetMs),
+      play,
     });
 
+    const totalMs = Math.max(0, clock() - startedAt);
     const summary = {
       name, chars: spoken.length, pieces: pieces.length,
       spoken: results.filter((r) => r.ok).length, outcome, results,
+      startedAt: new Date(startedAt).toISOString(), totalMs,
+      synthMs: results.reduce((a, r) => a + r.synthMs, 0),
+      playMs: results.reduce((a, r) => a + r.playMs, 0),
+    };
+    const receiptBody = {
+      outcome, chars: summary.chars, pieceCount: summary.pieces, spokenCount: summary.spoken,
+      startedAt: summary.startedAt, totalMs, synthMs: summary.synthMs, playMs: summary.playMs,
+      pieces: results.map(shape),
     };
 
     if (outcome === 'queued') {
       // A platform with no playback implementation leaves the envelope where it
       // is: it was not spoken, but nothing failed either, and the next drainer
       // (or the next run on Windows) must still find it.
-      return { ...summary, ok: false, queued: true, error: results.find((r) => r.queued)?.error };
+      //
+      // DELIBERATELY NO RECEIPT IS WRITTEN HERE, and this is the one branch where
+      // that is a decision rather than an omission. The queue directory is the
+      // INPUT directory: a second consumer is going to read it — the in-app
+      // watcher is the next step in the design notes — and every one of those
+      // readers expects to find envelopes there. A receipt is evidence of a
+      // finished delivery, and this delivery did not finish; the reason is on
+      // stderr with a failing exit code, which is where a delivery that did not
+      // happen belongs. The summary still carries every field a receipt would.
+      const error = results.find((r) => r.queued)?.error;
+      return { ...summary, ok: false, queued: true, error, receipt: null };
     }
     if (outcome === 'failed') {
-      file('.failed');
-      return { ...summary, ok: false, error: results.filter((r) => !r.ok).map((r) => `piece ${r.piece}/${r.of}: ${r.error}`).join('; ') };
+      const error = results.filter((r) => !r.ok).map((r) => `piece ${r.piece}/${r.of}: ${r.error}`).join('; ');
+      const receipt = deliver('.failed', { ...receiptBody, error });
+      return { ...summary, ok: false, error, receipt };
     }
-    file('.done');
-    return { ...summary, ok: true };
+    const receipt = deliver('.done', receiptBody);
+    return { ...summary, ok: true, receipt };
   } finally {
     for (const wav of temps) { try { unlinkSync(wav); } catch { /* best effort */ } }
   }
@@ -761,18 +954,28 @@ message sounds like the voice chosen in Settings → Voice.
  */
 export function describeFlush(r) {
   const plural = (k) => `${k} piece${k === 1 ? '' : 's'}`;
+  // Seconds, per piece, when there is more than one. One piece has nothing to
+  // break down, and a breakdown that restates the total teaches nothing.
+  const perPiece = (results) => {
+    if (!Array.isArray(results) || results.length < 2) return '';
+    return ' [' + results.map((p) => `p${p.piece} ${fmtMs(p.ms)}`).join(', ') + ']';
+  };
+  const took = (ms) => {
+    const s = fmtMs(ms);
+    return s ? `, ${s}` : '';
+  };
   if (r.ok) {
-    return { stream: 'stdout', text: `spoke ${r.name} (${r.chars} chars, ${plural(r.pieces)})\n` };
+    return { stream: 'stdout', text: `spoke ${r.name} (${r.chars} chars, ${plural(r.pieces)}${took(r.totalMs)}${perPiece(r.results)})\n` };
   }
   if (r.queued) {
     // Not spoken and not failed. Say so in those words, and still fail the exit
     // code: the human must never read this as "the message was delivered" when
     // no audio came out.
-    return { stream: 'stderr', text: `QUEUED NOT SPOKEN ${r.name} (${plural(r.pieces)}, 0 spoken): ${r.error}\n` };
+    return { stream: 'stderr', text: `QUEUED NOT SPOKEN ${r.name} (${plural(r.pieces)}, 0 spoken${took(r.totalMs)}${perPiece(r.results)}): ${r.error}\n` };
   }
   // The counts are the point: "2 of 5 spoken" says how much of the answer the
   // human actually got, and `r.error` names WHICH piece failed.
-  return { stream: 'stderr', text: `FAILED ${r.name} (${r.spoken} of ${plural(r.pieces)} spoken): ${r.error}\n` };
+  return { stream: 'stderr', text: `FAILED ${r.name} (${r.spoken} of ${plural(r.pieces)} spoken${took(r.totalMs)}${perPiece(r.results)}): ${r.error}\n` };
 }
 
 async function main(argv) {
@@ -876,6 +1079,10 @@ async function main(argv) {
       const d = describeFlush(r);
       if (d.stream === 'stdout') process.stdout.write(d.text);
       else { process.stderr.write(d.text); if (r.queued) queued++; else failed++; }
+      // A receipt that could not be written is reported, never swallowed: the
+      // whole point of the artifact is that it is the evidence, so losing it
+      // quietly would leave the next reader with the exact silence this fixed.
+      if (r.receipt && !r.receipt.ok) process.stderr.write(`  note ${r.receipt.error}\n`);
     }
     return (failed || queued) ? 1 : 0;
   }
