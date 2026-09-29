@@ -4491,6 +4491,24 @@ const taskDoneAnnouncer = new TaskDoneAnnouncer({
   push: (evt) => {
     try { liveWebContents()?.send('task:done', evt); } catch { /* window gone */ }
   },
+  // THE RECORD — the other half of this, and it was the half that was missing.
+  //
+  // `unnamed` is an OPTIONAL dep, and an optional dep that nobody passes is not a
+  // dep: `taskDoneAnnouncer` calls it with `?.` for a card that HAS an assignee it
+  // cannot name, so with no recorder here that call disappeared. The card was
+  // correctly not spoken AND correctly not written down — which is the shape of a
+  // defect that looks fixed, and is why silence is not a result.
+  //
+  // `hive.appendLog` writes the app's append-only feed (`log.jsonl`), so the id
+  // lands where a human and the tools can read it and NEVER reaches the speaker:
+  // `appendLog` is the record, `push` above is the voice, and the two are not
+  // interchangeable.
+  //
+  // The destructure is not decoration: `e.kind` is the TRANSITION (`done`,
+  // `blocked`), and `appendLog` writes its own `kind`. Spread without renaming
+  // and `e.kind` would overwrite the event kind and the transition would be lost
+  // from the only place it is written down.
+  unnamed: ({ kind, ...e }) => hive.appendLog({ kind: 'task-unnamed', transition: kind, ...e }),
   // The gate is the VOICE BACKEND, not a separate switch: a local voice is the
   // only one that can announce without OpenAI, so there is nothing to configure
   // and nothing that can end up announcing through a channel the user did not pick.
