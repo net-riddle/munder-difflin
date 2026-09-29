@@ -2,17 +2,12 @@
 
 const { copyFileSync, mkdirSync, statSync } = require('node:fs');
 const { dirname, join } = require('node:path');
+// The list lives in its own module because `electron.vite.config.ts` needs the
+// SAME one for `npm run dev`, which never runs this script. Two copies of this
+// array is how `tts-budget.cjs` came to be missing from dev — see main-sidecars.
+const { MAIN_ASSETS } = require('./main-sidecars.cjs');
 
 const ROOT = join(__dirname, '..');
-const MAIN_ASSETS = [
-  ['src/main/slack-trigger.cjs', 'out/main/slack-trigger.cjs'],
-  // Knowledge Graph core (pure-JS, no native deps) — required by knowledge.ts.
-  ['src/main/kg-core.cjs', 'out/main/kg-core.cjs'],
-  // The synthesis budget, shared with the voice-outbox script: a plain-JS module
-  // because node cannot import TypeScript, so the two speaking routes cannot
-  // drift into different ceilings. Required by realtime.ts.
-  ['src/main/tts-budget.cjs', 'out/main/tts-budget.cjs'],
-];
 
 for (const [fromRel, toRel] of MAIN_ASSETS) {
   const from = join(ROOT, fromRel);

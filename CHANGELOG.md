@@ -40,6 +40,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **The app no longer dies at launch with `Cannot find module './tts-budget.cjs'`.** The
+  raw `.cjs` sidecars the main process requires at runtime were listed in two places, and the
+  lists had drifted: `tts-budget.cjs` was in the build script but not in the vite hook that
+  copies sidecars. Since `npm run dev` runs neither the build nor the copy step, the file was
+  simply absent from `out/main` in development — the app crashed on launch there and only
+  there, which is why it looked intermittent and appeared to come back after being fixed.
+  Both paths now read one shared manifest, so a sidecar is added in a single place and the
+  two can no longer disagree.
 - **Test voice now actually plays the audio.** The button reported a byte count and stopped there,
   which proves a server answered but says nothing about whether the voice you picked is
   intelligible or in the right language — the only reason to press it. It now speaks the line

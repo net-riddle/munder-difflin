@@ -2,6 +2,14 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 import react from '@vitejs/plugin-react';
 import { resolve, dirname } from 'node:path';
 import { readFileSync, copyFileSync, mkdirSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
+
+// The runtime .cjs sidecars, from the one shared list. `createRequire` because
+// this config is loaded as ESM, and the manifest is plain .cjs precisely so
+// that node, the vite config and the build script can all read it.
+const { MAIN_ASSETS } = createRequire(import.meta.url)('./tools/main-sidecars.cjs') as {
+  MAIN_ASSETS: Array<[string, string]>;
+};
 
 // Single source of truth for the displayed app version: package.json.
 const pkg = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8'));
@@ -24,18 +32,18 @@ const defineMain = {
 // missing from out/main — which crashed the packaged app (#66) AND `npm run
 // dev` (#67). A writeBundle hook runs after the main build in BOTH dev and
 // build, so the sidecar is emitted from a single place for every path.
+//
+// THE LIST IS NOT WRITTEN HERE. It lives in `tools/main-sidecars.cjs`, shared
+// with `tools/copy-main-assets.cjs`, because this hook and that script are two
+// ways of copying the same files and they had drifted apart: tts-budget.cjs was
+// in the script but not here, and `npm run dev` does not run the script. So the
+// app died at launch in dev only, which is the one path that skips the copy.
+// A sidecar is now added in exactly one place.
 function copyMainSidecars() {
-  const ASSETS: Array<[string, string]> = [
-    ['src/main/slack-trigger.cjs', 'out/main/slack-trigger.cjs'],
-    // Knowledge Graph core: required by knowledge.ts at runtime (pure-JS, no
-    // native deps), so it must be emitted next to the main bundle like the
-    // Slack sidecar above.
-    ['src/main/kg-core.cjs', 'out/main/kg-core.cjs']
-  ];
   return {
     name: 'copy-main-cjs-sidecars',
     writeBundle() {
-      for (const [fromRel, toRel] of ASSETS) {
+      for (const [fromRel, toRel] of MAIN_ASSETS) {
         const from = resolve(__dirname, fromRel);
         const to = resolve(__dirname, toRel);
         mkdirSync(dirname(to), { recursive: true });

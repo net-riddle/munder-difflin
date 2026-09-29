@@ -68,9 +68,29 @@ test('one definition, two routes: the policy is not duplicated in the main modul
   assert.doesNotMatch(src, /SPEAK_BUDGET_(?:FLOOR|PER_CHAR|CEILING)_MS\s*=/, 'the numbers must not live here either');
   assert.match(src, /require\('\.\/tts-budget\.cjs'\)/, 'and it must load the shared module');
 
-  // and the shipped copy: without this entry the packaged build silently loses it
-  const copy = fs.readFileSync(path.join(__dirname, '..', 'tools', 'copy-main-assets.cjs'), 'utf8');
-  assert.match(copy, /src\/main\/tts-budget\.cjs/, 'copy-main-assets must ship it, or the packaged app has no budget');
+  // and the shipped copy: without this entry the packaged build silently loses it.
+  //
+  // This used to grep the TEXT of copy-main-assets.cjs for the filename. That
+  // stopped being true when the sidecar list moved into the shared manifest
+  // (tools/main-sidecars.cjs) — and the grep then passed against a script that
+  // no longer shipped anything on its own. The check follows the data, so it
+  // cannot be satisfied by a comment.
+  const { MAIN_ASSETS } = require('../tools/main-sidecars.cjs');
+  assert.ok(
+    MAIN_ASSETS.some(([from]) => from === 'src/main/tts-budget.cjs'),
+    'the shared manifest must ship tts-budget.cjs, or the packaged app has no budget'
+  );
+
+  // The manifest alone is not enough — it has to be REACHED on the path that
+  // breaks. `npm run dev` is plain `electron-vite dev` and never runs
+  // copy:main-assets, so only the writeBundle hook can save it; when the hook's
+  // private list went stale the app died at launch in dev and only in dev.
+  const viteCfg = fs.readFileSync(path.join(__dirname, '..', 'electron.vite.config.ts'), 'utf8');
+  assert.match(
+    viteCfg,
+    /main-sidecars\.cjs/,
+    'the vite hook must read the shared manifest, or npm run dev loses the sidecar'
+  );
 });
 
 test('a timeout says how long it waited, what it was allowed, and for how much text', () => {
