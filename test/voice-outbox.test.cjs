@@ -1190,3 +1190,49 @@ test('086: flushOne does not SPEAK an id — it files it, and says why', async (
   assert.equal(receipt.outcome, 'rejected');
   assert.match(receipt.error, /pam-mul0lzyj/, 'the receipt says which token stopped it');
 });
+
+// ─── 088: the queue has exactly two exits, and neither one is a deletion ─────
+//
+// An envelope went missing with no receipt anywhere: not queued, not done, not
+// failed. Before hunting for a cause, the cheapest thing in the world is to rule
+// the lane out — and the lane can be ruled out only if the claim is guarded.
+//
+// This reads the source. The claim is a CLAIM about behaviour, so testing it by
+// running it would be circular (a deleted envelope leaves nothing to assert on);
+// the source is the artefact, and the mutated-source test below is what proves
+// the guard is not a tautology.
+
+const TEMP_ARTEFACTS = ['ps1', 'tmp', 'wav'];
+
+function envelopeDeleters(source) {
+  // Every call that removes a file, and whether its argument names one of the
+  // three throwaway artefacts the lane is allowed to clean up.
+  const out = [];
+  for (const m of String(source).matchAll(/\b(unlinkSync|rmSync|rmdirSync)\s*\(\s*([^,)]+)/g)) {
+    const arg = m[2];
+    if (!TEMP_ARTEFACTS.some((a) => arg.includes(a))) out.push({ fn: m[1], arg: arg.trim() });
+  }
+  return out;
+}
+
+test('088: the lane never deletes an envelope, and the guard PROVES it can tell', () => {
+  const source = fs.readFileSync(MODULE_PATH, 'utf8');
+  const real = envelopeDeleters(source);
+  assert.deepEqual(real, [], `the queue has exactly two exits (rename into .done / .failed): ${JSON.stringify(real)}`);
+
+  // The half that makes the assertion above worth anything: the same function,
+  // fed a source that DOES delete an envelope, must find it. A guard that has
+  // never seen its own failure is a comment with an exit code.
+  const mutated = source.replace(
+    'renameSync(src, join(to, name));',
+    'unlinkSync(src); renameSync(src, join(to, name));'
+  );
+  assert.notEqual(mutated, source, 'the mutation must actually apply, or the proof is theatre');
+  const found = envelopeDeleters(mutated);
+  assert.equal(found.length, 1, JSON.stringify(found));
+  assert.match(found[0].arg, /src/, 'and it names the argument that would have eaten the envelope');
+
+  // The other direction: the temp files it DOES clean up must stay legal, or the
+  // guard would push the next person towards never unlinking anything.
+  assert.deepEqual(envelopeDeleters('unlinkSync(ps1); unlinkSync(tmp); unlinkSync(wav);'), []);
+});
