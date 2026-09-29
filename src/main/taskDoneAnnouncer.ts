@@ -44,8 +44,22 @@ export type TaskEventKind = 'start' | 'done' | 'blocked';
 export interface TaskDoneEvent {
   taskId: string;
   kind: TaskEventKind;
-  /** Friendly agent name when resolvable, else the raw id, else ''. */
+  /** Friendly agent name, or '' when the card has nobody to name. NEVER a raw
+   *  registry id: the user asked for those to stop, and a `??` that degrades to
+   *  the id is how they came back. See `whoOf`. */
   who: string;
+  title: string;
+  at: number;
+}
+
+/** A card that changed state but cannot be announced, because the agent it
+ *  belongs to has no resolvable name. It is NOT spoken: the id stays in this
+ *  record, where a human can read it, and never reaches the speaker. */
+export interface UnnamedCardEvent {
+  taskId: string;
+  kind: TaskEventKind;
+  /** The raw id, for diagnosis only. Nothing here is ever spoken. */
+  assignee: string;
   title: string;
   at: number;
 }
@@ -53,10 +67,15 @@ export interface TaskDoneEvent {
 export interface TaskDoneDeps {
   /** Current task cards. Called each poll; a throwing reader yields []. */
   tasks: () => TaskCard[];
-  /** Map an agent id to a friendly name. Optional; falls back to the raw id. */
+  /** Map an agent id to a friendly name. Optional; an unresolvable id means the
+   *  card is NOT announced — see `unnamed`. */
   nameOf?: (agentId: string) => string | null;
   /** Deliver the event. The only effect this module has. */
   push: (e: TaskDoneEvent) => void;
+  /** Record a card that could not be announced because its agent has no name.
+   *  Optional: with no recorder the transition is simply not announced, which
+   *  is still the correct thing to do out loud. */
+  unnamed?: (e: UnnamedCardEvent) => void;
   /** Master switch, read each poll. False ⇒ the poll is a no-op. */
   enabled: () => boolean;
   pollIntervalMs?: number;
@@ -97,8 +116,8 @@ function statusOf(card: TaskCard): string {
 /** The shape `registry.json` actually has. It is a MAP keyed by agent id —
  *  `{ godId, agents: { "jim-mugp1eoh": { id, name, … } } }` — and not an array.
  *  Both are accepted because the cost of being wrong here is not a crash: the
- *  reader below returns null, the caller falls back to the raw id, and the user
- *  HEARS "jim-mugp1eoh". */
+ *  reader below returns null, and the caller then does NOT announce the card
+ *  and records it instead. The id reaches a human, never the speaker. */
 export type AgentNameSource =
   | { agents?: Record<string, { id?: string; name?: string }> | Array<{ id?: string; name?: string }> }
   | null
@@ -130,12 +149,25 @@ export function agentNameIn(registry: AgentNameSource, id: string): string | nul
 }
 
 /** Who is this card about? assignee is the primary field; owner is the
- *  fallback some older cards use. */
+ *  fallback some older cards use.
+ *
+ *  RETURNS '' WHEN THE NAME CANNOT BE RESOLVED, and never the raw id.
+ *
+ *  This used to be `return (named ?? id).trim()`. On 2026-09-29 the user said,
+ *  in as many words, that hearing the full agent name with the code after the
+ *  dash is the defect to remove — and this `??` was the mouth it came out of.
+ *  It is the same shape as the `reg.agents.find(...)` bug above: a fallback
+ *  that degrades into a wrong answer which still looks like an answer, in the
+ *  one path the user is listening to.
+ *
+ *  The id is not lost by this: the caller records it (see `UnnamedCardEvent`),
+ *  which is where a human can read it. An id nobody can read is also not a
+ *  fix — the fix is that it is not SPOKEN. */
 export function whoOf(card: TaskCard, nameOf?: (id: string) => string | null): string {
   const id = (card.assignee ?? card.owner ?? '').trim();
   if (!id) return '';
   const named = nameOf?.(id);
-  return (named ?? id).trim();
+  return typeof named === 'string' ? named.trim() : '';
 }
 
 /** Titles are trimmed to something a voice can read. The card stays clickable
@@ -245,6 +277,28 @@ export class TaskDoneAnnouncer {
       const kind = transitionTo(prev, next);
       if (!kind) continue;
       const who = whoOf(card, this.deps.nameOf);
+      const assignee = (card.assignee ?? card.owner ?? '').trim();
+      if (assignee && !who) {
+        // The card belongs to somebody and we cannot name them. Announcing it
+        // would mean either speaking the id — which the user asked to stop
+        // hearing — or inventing a name. So it is NOT announced, and it IS
+        // recorded: an announcement that silently omits its subject is a lie
+        // about what happened, and a name that stopped resolving is a defect
+        // somebody has to be able to see.
+        try {
+          this.deps.unnamed?.({
+            taskId: card.id,
+            kind,
+            assignee,
+            title: titleOf(card),
+            at: Date.now()
+          });
+        } catch {
+          // Same trade as the push below: a failing recorder must not stop the
+          // loop, and the status is already remembered, so it is not retried.
+        }
+        continue;
+      }
       try {
         this.deps.push({
           taskId: card.id,

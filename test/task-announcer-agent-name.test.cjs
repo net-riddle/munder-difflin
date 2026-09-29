@@ -141,24 +141,29 @@ test('a card is announced by NAME, so no id reaches the speaker', () => {
     `the announcement must not end in a registry id, and it said "${who}"`);
 });
 
-test('the id fallback still exists, and it is the thing the human objected to', () => {
-  // Pinned from BOTH sides on purpose. The fallback is documented behaviour
-  // ("else the raw id"), so a test that only wanted names would pass while the
-  // user kept hearing ids whenever a lookup fails. This says: yes, the fallback
-  // is still there — which is why the lookup above is tested against the real
-  // file rather than trusted.
-  //
-  // THIS IS NOT A CLOSED QUESTION, and this test does not close it. It pins the
-  // behaviour so nobody changes it by accident; whether the fallback should be
-  // made visible in a log or removed outright is a decision about what the human
-  // hears, which is his. See the `093` case below for the other file that holds
-  // this same name.
+test('the id fallback is GONE: an unnameable agent is not announced as its id', () => {
+  // Pinned from BOTH sides on purpose, because this is the third time this
+  // function has been the mouth an id came out of. Before 2026-09-29 it was
+  // `named ?? id` and the user heard the full agent name with the code after
+  // the dash — the exact thing he asked to have removed. So the assertion is
+  // now on the ABSENCE of the id, not on the presence of a name: a test that
+  // only wanted names would pass while the user kept hearing ids.
   const card = { id: 'x', assignee: 'jim-mugp1eoh', status: 'done' };
-  assert.equal(ann.whoOf(card, () => null), 'jim-mugp1eoh',
-    'documented: with no name available the raw id is spoken');
-  assert.equal(ann.whoOf(card, undefined), 'jim-mugp1eoh');
+  assert.equal(ann.whoOf(card, () => null), '',
+    'a name that cannot be resolved yields no name, and the caller does not announce');
+  assert.equal(ann.whoOf(card, undefined), '',
+    'and with no lookup at all, still no id');
+  assert.equal(ann.whoOf(card, () => '   '), '',
+    'a blank name is not a name');
   assert.equal(ann.whoOf({ id: 'x', status: 'done' }, () => 'Jim'), '',
-    'and a card with nobody assigned is announced without a who, not with a blank id');
+    'a card with nobody assigned is announced without a who, not with a blank id');
+  // And the direction of the fix, so a future edit cannot quietly reintroduce
+  // the id by another route.
+  for (const lookup of [() => null, () => undefined, () => '', () => '  ']) {
+    const who = ann.whoOf(card, lookup);
+    assert.ok(!/-[a-z0-9]{5,}$/i.test(who),
+      `nothing that looks like a registry id may be spoken, and it said "${who}"`);
+  }
 });
 
 test('093: the name the human hears for god is ONE fact in two files', () => {

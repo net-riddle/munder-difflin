@@ -136,6 +136,85 @@ test('a card that exists and THEN blocks announces blocked exactly once', () => 
   assert.equal(events[0].kind, 'blocked', 'and never a phantom start: it never entered doing');
 });
 
+// ── 094: a card that cannot be NAMED is recorded, not announced ───────────────
+
+test('094: an unnameable agent is NOT announced at all, and is recorded instead', () => {
+  // The direction was the user's, in as many words: the id must stop being said.
+  // `whoOf` used to answer that with the raw id, so the only two ways out were
+  // speaking the id or inventing a name. So the card is not announced: the
+  // `*Unnamed` sentences exist and would be spoken for a card with nobody
+  // assigned, but here somebody IS assigned and we simply cannot name them, and
+  // a nameless announcement would hide a name that stopped resolving.
+  const events = [];
+  const unnamed = [];
+  let cards = [{ id: 'c4', status: 'doing', title: 'D', assignee: 'jim-mugp1eoh' }];
+  const a = new TaskDoneAnnouncer({
+    tasks: () => cards,
+    nameOf: () => null,                      // the lookup that used to fail
+    push: (e) => events.push(e),
+    unnamed: (e) => unnamed.push(e),
+    enabled: () => true
+  });
+  a.poll();                                  // baseline
+  cards = [{ id: 'c4', status: 'done', title: 'D', assignee: 'jim-mugp1eoh' }];
+  a.poll();
+
+  assert.equal(events.length, 0, 'nothing may be announced when the name is unresolvable');
+  assert.equal(unnamed.length, 1, 'and the transition is still recorded');
+  assert.equal(unnamed[0].assignee, 'jim-mugp1eoh',
+    'the id is kept in the record, where a human can read it — it is only the SPEAKER that never sees it');
+  assert.equal(unnamed[0].kind, 'done');
+  assert.equal(unnamed[0].title, 'D');
+  const spoken = JSON.stringify(unnamed[0]);
+  assert.ok(!/announc|speak/i.test(spoken), 'the record is not a sentence to be spoken');
+});
+
+test('094: a card with NOBODY assigned is still announced, without a who', () => {
+  // The distinction the previous code did not make: an unassigned card is a
+  // normal thing, and the `*Unnamed` sentences are for it. Only a card that HAS
+  // an assignee we cannot name is the defect. Collapsing the two would silence
+  // every unassigned card on the floor to fix one broken lookup.
+  const events = [];
+  const unnamed = [];
+  let cards = [{ id: 'c5', status: 'doing', title: 'E' }];
+  const a = new TaskDoneAnnouncer({
+    tasks: () => cards,
+    nameOf: () => null,
+    push: (e) => events.push(e),
+    unnamed: (e) => unnamed.push(e),
+    enabled: () => true
+  });
+  a.poll();
+  cards = [{ id: 'c5', status: 'done', title: 'E' }];
+  a.poll();
+  assert.equal(events.length, 1, 'an unassigned card is announced as before');
+  assert.equal(events[0].who, '');
+  assert.equal(unnamed.length, 0, 'and it is not a name failure');
+});
+
+test('094: a recorder that throws does not stop the poll loop', () => {
+  // Same trade as `push`: the status is already remembered, so this transition
+  // is not retried, and a throwing recorder must not cost every later card.
+  const events = [];
+  let cards = [{ id: 'c6', status: 'doing', title: 'F', assignee: 'nobody-here9' },
+    { id: 'c7', status: 'doing', title: 'G', assignee: 'jim-mugp1eoh' }];
+  const a = new TaskDoneAnnouncer({
+    tasks: () => cards,
+    nameOf: (id) => (id === 'jim-mugp1eoh' ? 'Jim' : null),
+    push: (e) => events.push(e),
+    unnamed: () => { throw new Error('recorder is down'); },
+    enabled: () => true
+  });
+  a.poll();
+  cards = [
+    { id: 'c6', status: 'done', title: 'F', assignee: 'nobody-here9' },
+    { id: 'c7', status: 'done', title: 'G', assignee: 'jim-mugp1eoh' }
+  ];
+  a.poll();
+  assert.equal(events.length, 1, 'the card AFTER the throwing one is still announced');
+  assert.equal(events[0].who, 'Jim');
+});
+
 // ── renderer: the sentence, which main cannot write ──────────────────────────
 
 test('the renderer routes kind=blocked to its own keys, never to the finished ones', () => {
