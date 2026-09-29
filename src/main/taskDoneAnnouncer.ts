@@ -94,9 +94,44 @@ function statusOf(card: TaskCard): string {
   return (card?.status ?? '').trim().toLowerCase();
 }
 
+/** The shape `registry.json` actually has. It is a MAP keyed by agent id —
+ *  `{ godId, agents: { "jim-mugp1eoh": { id, name, … } } }` — and not an array.
+ *  Both are accepted because the cost of being wrong here is not a crash: the
+ *  reader below returns null, the caller falls back to the raw id, and the user
+ *  HEARS "jim-mugp1eoh". */
+export type AgentNameSource =
+  | { agents?: Record<string, { id?: string; name?: string }> | Array<{ id?: string; name?: string }> }
+  | null
+  | undefined;
+
+/** The friendly name for an agent id, read from a registry. null when unknown.
+ *
+ *  Exported and tolerant of BOTH shapes on purpose. The bug this fixes was
+ *  written here once already: `test/capabilities.test.cjs` carries the note
+ *  "registry.json is `{ agents: { <id>: {...} } }`, NOT an array — reading it as
+ *  one is the mistake that produced a silent empty answer once already", written
+ *  for a DIFFERENT function. The same mistake was then made again, in
+ *  `index.ts`, against a `catch` that turned the TypeError into a null — so the
+ *  name lookup failed for EVERY card, silently, and the human heard the raw
+ *  registry id spoken on every announcement (2026-09-29).
+ *
+ *  -> A shape assumption with a `catch` around it does not fail: it degrades
+ *  into a wrong answer that still looks like an answer. The shape is asserted
+ *  by a test against the REAL registry file instead. */
+export function agentNameIn(registry: AgentNameSource, id: string): string | null {
+  const agents = registry?.agents;
+  if (!agents) return null;
+  if (Array.isArray(agents)) {
+    return agents.find((a) => a?.id === id)?.name ?? null;
+  }
+  const entry = agents[id];
+  const name = entry?.name;
+  return typeof name === 'string' && name.trim() ? name.trim() : null;
+}
+
 /** Who is this card about? assignee is the primary field; owner is the
  *  fallback some older cards use. */
-function whoOf(card: TaskCard, nameOf?: (id: string) => string | null): string {
+export function whoOf(card: TaskCard, nameOf?: (id: string) => string | null): string {
   const id = (card.assignee ?? card.owner ?? '').trim();
   if (!id) return '';
   const named = nameOf?.(id);

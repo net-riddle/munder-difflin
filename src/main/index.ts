@@ -53,7 +53,7 @@ import { registerRealtimeIpc } from './realtime';
 import { registerRealtimeActionIpc } from './realtimeActions';
 import { initCompletionWatcher } from './realtimeCompletionWatcher';
 import type { TaskCard, InboxMessage } from './realtimeCompletionWatcher';
-import { TaskDoneAnnouncer } from './taskDoneAnnouncer';
+import { TaskDoneAnnouncer, agentNameIn, type AgentNameSource } from './taskDoneAnnouncer';
 import { normalizeVoiceBackend } from '../shared/realtimeVoice';
 import { TelemetryCollector } from './telemetry';
 import { CostLedgerTotals } from './costLifetime';
@@ -4476,17 +4476,17 @@ completionWatcher.start();
 const taskDoneAnnouncer = new TaskDoneAnnouncer({
   tasks: () => (hive.tasks() as { tasks?: TaskCard[] } | null)?.tasks ?? [],
   nameOf: (id) => {
-    // Friendly name for a spoken sentence: "oscar-mqp3l5wn finished" is noise,
-    // "Oscar finished" is the notification. Best-effort — the announcer falls
-    // back to the raw id when an agent is archived mid-flight. The registry is
-    // widened through `unknown` because the announcer only needs two fields and
-    // a cast to a partial shape would be rejected against the real type.
-    try {
-      const reg = hive.registry() as unknown as { agents?: { id?: string; name?: string }[] };
-      return reg.agents?.find((a) => a?.id === id)?.name ?? null;
-    } catch {
-      return null;
-    }
+    // Friendly name for a spoken sentence: "jim-mugp1eoh ha finito" is noise,
+    // "Jim ha finito" è la notifica.
+    //
+    // The lookup lives in `taskDoneAnnouncer` and is TESTED AGAINST THE REAL
+    // REGISTRY, because it used to be written here as `reg.agents.find(...)` on
+    // a value that is a map, not an array. `find` was undefined, the TypeError
+    // was caught by the `catch` below and became `null`, and every announcement
+    // therefore fell back to the raw id — which is the thing the user complained
+    // about hearing on 2026-09-29. A shape assumption wrapped in a `catch` does
+    // not fail; it degrades into a wrong answer that still looks like an answer.
+    return agentNameIn(hive.registry() as AgentNameSource, id);
   },
   push: (evt) => {
     try { liveWebContents()?.send('task:done', evt); } catch { /* window gone */ }
