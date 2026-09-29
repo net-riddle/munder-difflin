@@ -125,3 +125,66 @@ test('094: a refusal to the sender does not become a message the sender can boun
   assert.equal(hive.logTail(500).filter((e) => e.kind === 'drop' && e.reason === 'no-inbox').length, 1,
     'and the drop is counted once, not once per pass');
 });
+
+// ── 3. THE BITE TEST, ON THE PATH THAT ACTUALLY ARCHIVES ───────────────────
+
+/**
+ * The test above is not the bite test, and saying so is the point of this one.
+ *
+ * Every test above calls `hive.send()`, which routes the message DIRECTLY into the
+ * recipient's inbox and never touches the outbox. But `outbox/.sent/` — the folder
+ * whose name tells the sender their mail went out — is only written by `routeOnce`,
+ * on the file an external writer (`msg.cjs`) left in the outbox. **So the whole
+ * suite above passed while the folder that makes a refusal look like a delivery was
+ * never written even once.** Measured: `hive.send()` leaves the outbox empty and
+ * `routeOnce()` reports 0.
+ *
+ * That is this card's own rule, caught in its own test file: *a test that does not
+ * go through the mechanism cannot fail on the mechanism.*
+ */
+test('094: BITE TEST — a refused message leaves no file in .sent/ that reads as a delivery', async (t) => {
+  const { home, hive } = await floor(t);
+  const outbox = path.join(home, 'hive', 'agents', 'jim-1', 'outbox');
+
+  // This is how mail actually enters the floor: a file in the sender's outbox,
+  // which the router picks up. `hive.send()` is the shortcut, and it skips all of it.
+  fs.writeFileSync(path.join(outbox, 'a-rifiutata.json'),
+    JSON.stringify({ to: 'pam-mul0zyj', act: 'request', subject: 'RIFIUTATA', body: 'x' }), 'utf8');
+  fs.writeFileSync(path.join(outbox, 'b-consegna.json'),
+    JSON.stringify({ to: 'pam-mul0lzyj', act: 'request', subject: 'CONSEGNA', body: 'x' }), 'utf8');
+
+  assert.ok(hive.routeOnce() >= 2, 'the router really did pick both up, so this test is not passing vacuously');
+
+  const archivi = fs.readdirSync(path.join(outbox, '.sent'));
+
+  // THE BITE TEST. A refused message filed in a folder named "sent", under its own
+  // name, is the defect: the sender looking at their own archive has no way to tell
+  // it from the one that arrived.
+  //
+  // WHAT the marker is, matters and I got this wrong twice writing it. The refusal
+  // is carried by the FILENAME, not by the content: the `bad-` prefix is the same
+  // convention the quarantine already used, so a sender learns one rule instead of
+  // two, and the body stays byte-identical to what was written — a refusal is not a
+  // rewrite of somebody's message. So the test asks about the name, and the sentence
+  // with the near-miss lives in the sender's inbox, asserted below.
+  //
+  // (Asserting on the CONTENT was my first two attempts. It flagged the delivered
+  // message, then flagged the refused one *after the fix*, because `bad-` does not
+  // touch the body. A test that checks the wrong field is worse than no test: it
+  // looks like it is holding the mechanism to account.)
+  assert.equal(archivi.includes('a-rifiutata.json'), false,
+    'the refused file must NOT sit in the sender\'s "sent" folder under its own name. Before this fix it was archived as `a-rifiutata.json` with its original subject, and nothing in that folder said it had reached nobody.');
+
+  // and the refused one is visibly marked, by the SAME convention the quarantine
+  // already uses — one convention the sender learns once, not two
+  const rifiutati = archivi.filter((f) => f.startsWith('bad-'));
+  assert.equal(rifiutati.length, 1, 'the refused message is archived as bad-, not silently as sent: ' + JSON.stringify(archivi));
+  assert.equal(archivi.length, 2, 'and nothing is lost: both files survive, because a refusal still has to be auditable');
+
+  // the delivered one is untouched by this change — `bad-` is for refusals only
+  assert.ok(archivi.includes('b-consegna.json'), 'a real delivery is archived under its own name, as before');
+
+  // and the sender still gets the sentence with the near-miss in their inbox
+  assert.equal(hive.inbox('jim-1').length, 1, 'the sender is still told, in the place they look');
+  assert.match(hive.inbox('jim-1')[0].subject, /the closest is "pam-mul0lzyj"/);
+});

@@ -1572,12 +1572,23 @@ export class HiveManager {
     return msg;
   }
 
-  private routeMessage(msg: HiveMessage): void {
+  /**
+   * Route one message. Returns TRUE when at least one target actually took it.
+   *
+   * The return value exists for the ARCHIVE, and it is the last piece of 094. A
+   * sender who looks at their own `outbox/.sent/` and finds a file concludes the
+   * message went out — the folder is literally named "sent". So for a message that
+   * reached nobody, `routeOnce` has to archive it under the `bad-` prefix that the
+   * quarantine already uses, or the refusal lives only in an inbox and the sender's
+   * own record still says the opposite. *A refusal the sender cannot see in the
+   * place they would look is not a refusal; it is a rumour.*
+   */
+  private routeMessage(msg: HiveMessage): boolean {
     if (msg.hops > HOP_CAP) {
       // loop guard — drop a runaway message rather than let agents ping-pong.
       // There's no human queue to fall back on; the god agent owns conflicts.
       this.appendLog({ kind: 'drop', reason: 'hop-cap', from: msg.from, to: msg.to, id: msg.id });
-      return;
+      return false;
     }
     const reg = this.registry();
     const godId = reg.godId ?? 'god';
@@ -1702,6 +1713,7 @@ export class HiveManager {
     // Main-process observer (e.g. the closing-time controller watching for the
     // team's ACKs and the god's COMPLETE). Best-effort, never breaks routing.
     try { this.routedObserver?.(msg, targets); } catch { /* observer error */ }
+    return delivered.length > 0;
   }
 
   /** Observer invoked for EVERY routed message with its resolved targets.
@@ -1781,8 +1793,13 @@ export class HiveManager {
           const partial = JSON.parse(readFileSync(full, 'utf8')) as Partial<HiveMessage>;
           const msg = this.normalize(partial, id);
           msg.from = id; // sender is authoritative — the owning directory
-          this.routeMessage(msg);
-          renameSync(full, join(outbox, '.sent', f)); // archive, don't reprocess
+          const consegnato = this.routeMessage(msg);
+          // Archive it, but NOT as plain "sent" when nobody took it. `outbox/.sent/`
+          // is named for what happened, and a refused message filed there under its
+          // own name tells the sender the exact opposite of the truth. `bad-` is the
+          // prefix the quarantine below already uses for the same class of outcome,
+          // so the sender reads one convention, not two.
+          renameSync(full, join(outbox, '.sent', consegnato ? f : `bad-${f}`)); // archive, don't reprocess
           routed++;
         } catch {
           // malformed file — quarantine so we don't spin on it
