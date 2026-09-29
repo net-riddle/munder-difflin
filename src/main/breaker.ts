@@ -349,6 +349,29 @@ export class CircuitBreaker {
     isTopTokenSpender: boolean,
     costCapTokens: number | undefined
   ): { tripping: boolean; reason: string } {
+    // The count of calls that arrived with no tool_input at all. It used to be
+    // appended to the LOOPING reason only, which made it unreachable in exactly
+    // the case it was built for: a call with no input is not compared, so it
+    // never increments repeatCount, so an agent whose calls are ALL invisible
+    // can never trip the loop arm — and that arm was the only reader. The
+    // counter could be incremented and never printed.
+    //
+    // So it rides on EVERY trip below, whichever arm fires. An agent making
+    // invisible calls next to a visible error storm now reads "error storm: 5
+    // consecutive api errors/retries — plus 40 call(s) with NO tool_input", and
+    // the operator can see that part of the picture was never there. That is not
+    // a new trip policy: an all-invisible agent still does not trip, because
+    // "the harness never sends input" is indistinguishable from "the agent is
+    // looping invisibly" and inventing that call could stop a healthy worker.
+    // What changes is that the fact is no longer invisible when something ELSE
+    // does trip.
+    const unseen = s.unidentifiedToolUses > 0
+      ? ` — plus ${s.unidentifiedToolUses} call(s) with NO tool_input, not comparable, not counted`
+      : '';
+    /** One trip, carrying the invisible-call count, whichever arm produced it. */
+    const trip = (reason: string): { tripping: boolean; reason: string } =>
+      ({ tripping: true, reason: `${reason}${unseen}` });
+
     // (b) repeated identical tool calls
     if (s.repeatCount >= cfg.repeatedToolLimit) {
       // Print the WHOLE key, not just the tool name. The old form interpolated
@@ -364,27 +387,24 @@ export class CircuitBreaker {
       // quietly is worth ten reviews, and a stream of calls with no
       // tool_input is a harness fault that would otherwise read as "the agent
       // looped" for ever.
-      const unseen = s.unidentifiedToolUses > 0
-        ? ` — plus ${s.unidentifiedToolUses} call(s) with NO tool_input, not comparable, not counted`
-        : '';
-      return { tripping: true, reason: `looping: ${s.repeatCount}× identical tool call (${s.repeatKey ?? '?'})${unseen}` };
+      return trip(`looping: ${s.repeatCount}× identical tool call (${s.repeatKey ?? '?'})`);
     }
     // (b) api_error storm
     if (s.errorCount >= cfg.errorStormLimit) {
-      return { tripping: true, reason: `error storm: ${s.errorCount} consecutive api errors/retries` };
+      return trip(`error storm: ${s.errorCount} consecutive api errors/retries`);
     }
     // (a) per-agent token limit — this agent's own total over its configured cap
     const perAgentCap = cfg.agentTokenCaps?.[input.agentId];
     if (typeof perAgentCap === 'number' && perAgentCap > 0 && tokensOf(input.sample) > perAgentCap) {
-      return { tripping: true, reason: `token limit: ${tokensOf(input.sample).toLocaleString()} over the agent cap of ${perAgentCap.toLocaleString()}` };
+      return trip(`token limit: ${tokensOf(input.sample).toLocaleString()} over the agent cap of ${perAgentCap.toLocaleString()}`);
     }
     // (a) cost cap — floor total over cap, this agent is the biggest spender
     if (isTopSpender && typeof costCapUsd === 'number') {
-      return { tripping: true, reason: `cost cap: floor total over $${costCapUsd} (top spender $${(input.sample?.usd ?? 0).toFixed(2)})` };
+      return trip(`cost cap: floor total over $${costCapUsd} (top spender $${(input.sample?.usd ?? 0).toFixed(2)})`);
     }
     // (a) token cap — floor total tokens over cap, this agent is the biggest spender
     if (isTopTokenSpender && typeof costCapTokens === 'number') {
-      return { tripping: true, reason: `token cap: floor total over ${costCapTokens.toLocaleString()} tokens (top spender ${tokensOf(input.sample).toLocaleString()})` };
+      return trip(`token cap: floor total over ${costCapTokens.toLocaleString()} tokens (top spender ${tokensOf(input.sample).toLocaleString()})`);
     }
     // (a) token-velocity spike — diff cumulative output across consecutive beats.
     // Skipped entirely while a compaction is in flight (+ trailing grace): a
@@ -397,7 +417,7 @@ export class CircuitBreaker {
       if (dOut > 0 && dMin > 0) {
         const velocity = dOut / dMin;
         if (velocity > cfg.tokenVelocityPerMin) {
-          return { tripping: true, reason: `token velocity ${Math.round(velocity)}/min > ${cfg.tokenVelocityPerMin}/min` };
+          return trip(`token velocity ${Math.round(velocity)}/min > ${cfg.tokenVelocityPerMin}/min`);
         }
         // (c) no-progress: burning output tokens while not coordinating. A recent
         // DISTINCT tool call counts as progress too — background workflows and
@@ -409,7 +429,7 @@ export class CircuitBreaker {
         if (!input.progressing && !toolActive) {
           s.noProgressBeats += 1;
           if (s.noProgressBeats >= NO_PROGRESS_BEATS) {
-            return { tripping: true, reason: 'no-progress: generating tokens without coordinating (stale log/files)' };
+            return trip('no-progress: generating tokens without coordinating (stale log/files)');
           }
         } else {
           s.noProgressBeats = 0;
