@@ -24,6 +24,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const loadTs = require('./load-ts.cjs');
 
 const ann = loadTs('src/main/taskDoneAnnouncer.ts');
@@ -32,6 +33,61 @@ const REAL_REGISTRY =
   'F:/workspace/projects/ai-office/nemesi-office/hive/registry.json';
 const hasReal = fs.existsSync(REAL_REGISTRY);
 const real = hasReal ? JSON.parse(fs.readFileSync(REAL_REGISTRY, 'utf8')) : null;
+
+// The second channel, and the only other place that decides a spoken name. The
+// queue keeps its own map (`SUFFIXLESS_ID_NAMES` in voice-outbox.mjs) because
+// `god` has no suffix and no shape can find it. Read through the module's own
+// answer rather than by parsing the source, so the check cannot be satisfied by
+// a string that happens to be in the file.
+//
+// MD_VOICE_QUEUE_MODULE points the check at a different copy of that file on
+// purpose. Every agent also carries a per-agent copy of voice-outbox.mjs, and
+// the process that actually speaks may be running one of those rather than this
+// repo's — a check that can only look at the repo is a check that cannot see
+// the copy in the mouth.
+const QUEUE_MODULE = pathToFileURL(
+  process.env.MD_VOICE_QUEUE_MODULE ||
+    path.join(__dirname, '..', 'resources', 'skills', 'md-voice-brief', 'voice-outbox.mjs')
+).href;
+let queue;
+test.before(async () => { queue = await import(QUEUE_MODULE); });
+
+/** What the queue would have the speaker say for a suffixless id. */
+function queueSays(token) {
+  const found = (queue.findUnpronounceableNames(`${token} ha chiuso la card.`) || [])
+    .find((f) => f.token === token);
+  return found ? found.say : null;
+}
+
+/**
+ * THE RELATION, as one assertion, used by the test and by its own proof.
+ *
+ * Two files hold the name the human hears when the orchestrator is announced:
+ * `registry.json` -> `agents.<godId>.name`, read by the announcer, and
+ * `voice-outbox.mjs` -> `SUFFIXLESS_ID_NAMES`, read by the queue. They are two
+ * copies of one fact, in two channels, and nothing else keeps them together —
+ * they agree today because both were written with the same word in them.
+ *
+ * The tests above assert the VALUE twice. Two equal assertions cannot notice
+ * that they are two: change one and the other still passes. This one compares,
+ * so moving either side is visible here and nowhere else.
+ *
+ * `registry.json` is READ, never written: it is the floor's roster, and a value
+ * in two places is settled by removing one of them, not by adding a third.
+ */
+function assertOneSpokenName(reg) {
+  const fromRegistry = ann.agentNameIn(reg, reg.godId);
+  const fromQueue = queueSays(String(reg.godId));
+  assert.ok(fromRegistry,
+    `registry.json: agents.${reg.godId}.name is empty, so the announcer falls back to the raw id`);
+  assert.ok(fromQueue,
+    `voice-outbox.mjs: SUFFIXLESS_ID_NAMES has no entry for "${reg.godId}", so the queue has nothing to say`);
+  assert.equal(fromQueue, fromRegistry,
+    `"${reg.godId}" is announced as "${fromRegistry}" by registry.json and as ` +
+    `"${fromQueue}" by voice-outbox.mjs. Two files hold the name the human ` +
+    'hears; they are one fact and must be changed together — or, better, one of ' +
+    'them removed.');
+}
 
 test('the registry on disk is a MAP keyed by id, so an array read cannot work', () => {
   // The shape assumption itself, asserted against the real file. This is the
@@ -91,10 +147,43 @@ test('the id fallback still exists, and it is the thing the human objected to', 
   // user kept hearing ids whenever a lookup fails. This says: yes, the fallback
   // is still there — which is why the lookup above is tested against the real
   // file rather than trusted.
+  //
+  // THIS IS NOT A CLOSED QUESTION, and this test does not close it. It pins the
+  // behaviour so nobody changes it by accident; whether the fallback should be
+  // made visible in a log or removed outright is a decision about what the human
+  // hears, which is his. See the `093` case below for the other file that holds
+  // this same name.
   const card = { id: 'x', assignee: 'jim-mugp1eoh', status: 'done' };
   assert.equal(ann.whoOf(card, () => null), 'jim-mugp1eoh',
     'documented: with no name available the raw id is spoken');
   assert.equal(ann.whoOf(card, undefined), 'jim-mugp1eoh');
   assert.equal(ann.whoOf({ id: 'x', status: 'done' }, () => 'Jim'), '',
     'and a card with nobody assigned is announced without a who, not with a blank id');
+});
+
+test('093: the name the human hears for god is ONE fact in two files', () => {
+  // The real floor, against the real module. If either side moves, this is the
+  // only assertion on the floor that notices.
+  if (!hasReal) return; // no floor to read; the proof below still runs
+  assertOneSpokenName(real);
+});
+
+test('093: the relation check can actually die, and it says where to look', () => {
+  // A check that has never been seen red is a check nobody knows works. The
+  // doctored registry differs from the module in exactly one word — the same
+  // edit a rename would make — and the assertion has to fail while naming BOTH
+  // files, because "they diverged" is only useful if it says which one moved.
+  //
+  // The divergence is DERIVED from whatever the queue says, not spelled out, so
+  // this test cannot rot when the name changes: a hardcoded word here would
+  // quietly stop being a divergence the day the real value became that word.
+  const token = 'god';
+  const live = queueSays(token);
+  assert.ok(live, 'the queue must have a spoken name for the token under test');
+  const diverged = { godId: token, agents: { [token]: { id: token, name: `${live} (renamed)` } } };
+  assert.throws(
+    () => assertOneSpokenName(diverged),
+    (err) => /registry\.json/.test(err.message) && /voice-outbox\.mjs/.test(err.message),
+    'a diverged pair must fail the relation, and the failure must name both files'
+  );
 });
