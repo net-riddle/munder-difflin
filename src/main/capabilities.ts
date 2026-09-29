@@ -104,12 +104,42 @@ export function deriveCapabilities(meta: {
   if (meta.isGod) out.push('orchestrator');
   const cwd = (meta.cwd ?? '').replace(/\\/g, '/').toLowerCase();
   if (cwd) {
-    if (cwd.includes('/munder-difflin')) out.push('voice-sender');
+    // The office IS munder-difflin, so the office lane derives from it. This
+    // hole was pointed out on 2026-09-29: the field that answers "who should"
+    // was built on a table that did not cover the office, and a hole in the
+    // table is a hole in the answer.
+    if (cwd.includes('/munder-difflin')) out.push('office-dev');
     if (cwd.includes('/rush-breaker')) out.push('rush-breaker');
     if (cwd.includes('/cacioverse')) out.push('cacioverse');
   }
   return out;
 }
+
+/**
+ * Capabilities the system CANNOT derive, each with the reason.
+ *
+ * Exported so the list of holes is part of the module's surface rather than a
+ * comment nobody re-reads: a hole nobody wrote down is a hole someone will
+ * rediscover as a missing answer.
+ *
+ * `voice-sender` is here because of a counterexample, not a hunch. On
+ * 2026-09-28 the office lane held TWO agents in cwd `munder-difflin` and only
+ * one of them sent voice messages — the other is its developer. A directory
+ * cannot tell those two apart, so anything derived from cwd would have
+ * designated BOTH, which is precisely the "two correct answers" failure this
+ * field exists to remove. Deriving it would have been inventing a designation.
+ * It needs a fact the system does not yet have.
+ */
+export const NOT_DERIVABLE: ReadonlyArray<{
+  capability: Capability;
+  because: string;
+}> = [
+  {
+    capability: 'voice-sender',
+    because:
+      'two agents share cwd munder-difflin and only one sends voice messages, so a directory cannot designate a function. Needs a fact the system does not have yet.'
+  }
+];
 
 /** The minimal registry shape this module needs. */
 export interface CapabilityRosterEntry {
