@@ -963,6 +963,40 @@ export function writeReceipt(dir, name, receipt) {
 
 // ─── the claim: who owns the right to speak this envelope ─────────────────────
 
+/**
+ * **PROVATO PER LETTURA, NON OSSERVATO.** Read this before trusting the claim.
+ *
+ * The honest answer to "have two voices ever overlapped?" is **UNKNOWN**, and it
+ * is unknown rather than zero. That is a measurement, not a shrug: across 10 719
+ * files in 1 453 folders there were **zero receipts, zero voice envelopes, zero
+ * `.claim` directories, and no log event recording that anything sounded at all**
+ * (god, 2026-09-29, `task-jim-098`). So the record is not a clean run in which
+ * nothing overlapped — it is an absence of record, and *an absence of record is
+ * not a record of absence.* A claim that reports "no overlap seen" here is
+ * reporting the emptiness of the log and calling it a result.
+ *
+ * **WHY IT CANNOT BE OBSERVED FROM HERE, and the reason is a fact.** There are two
+ * drainers on this floor: this script, and the renderer
+ * (`src/renderer/src/realtime/localVoice.ts`), which speaks from the app window.
+ * The two can only be seen overlapping by running the app and listening to it at
+ * the same time, and that is outside what an agent here may do — no app, no
+ * ports, no browser. So the answer is **(b) not possible here**, and it stays (b)
+ * until somebody with an app runs two watchers. *Choosing (a) because the tests
+ * are green would be choosing the flattering letter.*
+ *
+ * **WHAT IS ACTUALLY PROVEN, precisely, so the line above is not read as "nothing
+ * works":** the claim's arithmetic is derived in `CLAIM_WINDOW_MS` below from
+ * measured synthesis and playback; the per-piece renewal is unit-tested; and a
+ * single drainer speaking is exercised by the suite. What is missing is the only
+ * thing that matters for overlap: **two drainers, live, at once.** Those are three
+ * different claims, and the third is the one nobody has.
+ *
+ * This block lives HERE, and not on the card, because this is where the decision
+ * gets made. A statement in a card is a thought; a statement at the point of
+ * decision is a condition — and this is the one that must stop the next reader from
+ * concluding that overlap was ruled out.
+ */
+
 /** Where an envelope lives while a drainer owns it. */
 export const CLAIM_DIR = '.claim';
 
