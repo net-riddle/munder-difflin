@@ -15,18 +15,33 @@
  * fix. Aligning them is a habit, and a habit has not once been right by
  * construction.
  *
- * SO THE COPIES ARE GONE, and this asserts the thing that is true afterwards:
+ * THE COPIES CAME BACK, and that is the product working, not a regression.
+ *
+ * `src/main/hive.ts:672` calls `copyBundledSkills(opts.skillsDir, join(dir,
+ * '.claude', 'skills'))` on every spawn, so each agent's `.claude/skills/` holds
+ * a fresh copy of every bundled skill — measured: five files, five identical
+ * hashes, repo and all four agents. Deleting the copies was never a state that
+ * could hold; the next spawn puts them back.
+ *
+ * So an earlier version of this file asserted "no second copy of the script
+ * exists", and it could only ever be red. That is worse than being wrong: a
+ * guard that stands red forever is a guard people learn to scroll past, and it
+ * has displaced the guard that was actually needed.
+ *
+ * THE INVARIANT THAT CAN HOLD, and that catches the real failure:
  *
  *   1. the script the lane runs IS the file in the repository
- *   2. no second copy of it exists anywhere in the hive
- *   3. the skill says to run the repository file, not a private one
+ *   2. the skill says to run the repository file, not a private one
+ *   3. EVERY COPY of the script is byte-identical to the repository's, and a
+ *      copy that is not says WHICH AGENT and shows BOTH hashes
  *   4. any SKILL.md still lying around matches the repository's
  *
- * This is a POSITIVE assertion on purpose. The earlier version compared every
- * agent's copy to the repo, which could only ever end red — and a guard that
- * stands red forever is a guard people learn to scroll past. A uniqueness claim
- * can be green forever, and when it does go red it means something real: a
- * fallback came back, and the route that speaks is no longer the route in the repo.
+ * (3) is the one that matters, and it is strictly stronger than the uniqueness
+ * claim it replaces: "there is no second copy" is satisfied by deleting them,
+ * which is a thing you can do by accident. "Every copy matches" is satisfied
+ * only by the product doing its job, and it goes red the moment a copy is left
+ * behind by a build, a partial write, or a hand edit. The residual risk is
+ * honest and small: a copy can be at most one spawn behind the repository.
  *
  * It also stops depending on a hand-written list of who executes what. A test
  * that needs to be told which agents are allowed to speak is one list away from
@@ -144,16 +159,53 @@ test('the skill tells you to run the repository file, not a private copy', () =>
   assert.match(text, /VOICE_OUTBOX=/, 'the path is set once and used for all three steps');
 });
 
-test('no second copy of the script exists anywhere in the agents\' trees', (t) => {
+/**
+ * Copies of `fileName` under the agents' trees that do NOT match `repoFile`.
+ *
+ * The real test and the fixture test below both go through this, on purpose: a
+ * guard proven on a re-implementation of its own logic has proven nothing about
+ * the logic it ships. The 037 lesson, applied to myself — that test was found
+ * answering questions about 15.000 unrelated characters because it was not
+ * looking at the file it thought it was.
+ *
+ * `agent` and both hashes are carried out, because a failure that says "a
+ * divergence exists" makes the reader go and find five files to compare by
+ * hand. One that names the agent and prints both hashes tells them what to
+ * re-align.
+ */
+function divergentCopies(laneRoot, repoFile, fileName = SCRIPT) {
+  const want = sha256(repoFile);
+  return copiesUnder(laneRoot, fileName)
+    .filter((c) => path.resolve(c.file) !== path.resolve(repoFile))
+    .map((c) => ({ ...c, want, got: sha256(c.file) }))
+    .filter((c) => c.got !== c.want);
+}
+
+/** The failure text, built once so the message and the fixture cannot drift. */
+const divergenceReport = (stale) => [
+  'every copy of the speaking script must be byte-identical to the repository\'s.',
+  'These are behind — the harness rewrites them on the next spawn, or copy the file across:',
+  ...stale.map((c) => [
+    `  agent ${c.agent}`,
+    `    copy ${c.got}`,
+    `    repo ${c.want}`,
+    `    at   ${c.file}`,
+  ].join('\n')),
+  'A copy that has drifted is the failure this file exists for: the route that',
+  'speaks would be running a different program from the one in the repository,',
+  'and nothing anywhere would say so.',
+].join('\n');
+
+test("every copy of the speaking script is byte-identical to the repository's", (t) => {
   const lane = findLaneRoot();
   if (!lane) { t.skip(`no hive found (HIVE_ROOT=${process.env.HIVE_ROOT || 'unset'}) — nothing to compare, so nothing is asserted`); return; }
 
-  const strays = copiesUnder(lane, SCRIPT).filter((c) => path.resolve(c.file) !== path.resolve(path.join(REPO_DIR, SCRIPT)));
-  assert.deepEqual(strays, [], [
-    'the Vocal Sender must exist once, in the repository. These are copies of it:',
-    ...strays.map((c) => `  ${c.agent}: ${c.file}`),
-    'a fallback that behaves like the real thing is worse than no fallback, because nothing tells you which one you ran.',
-  ].join('\n'));
+  const stale = divergentCopies(lane, path.join(REPO_DIR, SCRIPT));
+  assert.deepEqual(
+    stale.map((c) => `agent ${c.agent} — copy ${c.got.slice(0, 12)}, repo ${c.want.slice(0, 12)}, at ${c.file}`),
+    [],
+    divergenceReport(stale)
+  );
 });
 
 test("the voice lane's own instructions match the repository's, wherever they survive", (t) => {
@@ -224,22 +276,42 @@ test('the per-skill reference does not confuse one skill for another', () => {
     'a copy holding another skill\'s text must read as stale — this is the case the old reference called correct');
 });
 
-test('the guard still fails when a second copy exists', () => {
-  // A uniqueness claim that cannot fail is a comment. This proves it on a
-  // fixture, because the real tree is the thing that is supposed to be clean —
-  // and a guard tested only against a clean tree is a guard that has never been
-  // seen to work.
+test('the guard still fails when a copy is behind, and it names who', () => {
+  // An invariant that cannot fail is a comment. This proves it on a fixture,
+  // because the real tree is the thing that is supposed to be clean — and a
+  // guard tested only against a clean tree is a guard that has never been seen
+  // to work.
+  //
+  // The shape here is the one that used to be invisible: a copy that is PRESENT
+  // and IDENTICAL is now correct, and only a copy that is present and BEHIND is
+  // red. So the fixture carries all three cases at once — an identical copy, a
+  // drifted copy, and no copy at all — and only the middle one may be reported.
   const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'vo-lane-'));
-  const laneAgents = path.join(root, 'agents');
-  const dir = path.join(laneAgents, 'someone', '.claude', 'skills', 'md-voice-brief');
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, SCRIPT), 'a copy\n', 'utf8');
-  fs.writeFileSync(path.join(dir, SKILL), fs.readFileSync(path.join(REPO_DIR, SKILL)));
+  const repoFile = path.join(root, 'resources', 'skills', LANE_SKILL, SCRIPT);
+  fs.mkdirSync(path.dirname(repoFile), { recursive: true });
+  fs.writeFileSync(repoFile, 'the repository version\n', 'utf8');
 
-  const strays = copiesUnder(root, SCRIPT);
-  assert.equal(strays.length, 1, 'the copy must be found');
-  assert.equal(strays[0].agent, 'someone', 'and attributed to the agent it belongs to, not to a dot-directory');
+  const laneDir = (agent) => path.join(root, 'agents', agent, '.claude', 'skills', LANE_SKILL);
+  fs.mkdirSync(laneDir('aligned'), { recursive: true });
+  fs.writeFileSync(path.join(laneDir('aligned'), SCRIPT), 'the repository version\n', 'utf8');
+  fs.mkdirSync(laneDir('behind'), { recursive: true });
+  fs.writeFileSync(path.join(laneDir('behind'), SCRIPT), 'an older program\n', 'utf8');
+  // 'absent' gets a skill folder with no script in it at all.
 
-  fs.unlinkSync(path.join(dir, SCRIPT));
-  assert.deepEqual(copiesUnder(root, SCRIPT), [], 'and gone once it is gone');
+  const stale = divergentCopies(root, repoFile);
+  assert.deepEqual(stale.map((c) => c.agent), ['behind'],
+    'only the copy that is behind the repository may be reported — an identical copy is the product working');
+
+  // The two things the card asks the message to carry, checked on the text that
+  // would actually be printed rather than on the objects behind it.
+  const report = divergenceReport(stale);
+  assert.match(report, /agent behind/, 'the report must name WHICH agent is behind');
+  assert.match(report, new RegExp(sha256(repoFile)), 'and show the repository hash');
+  assert.match(report, new RegExp(sha256(path.join(laneDir('behind'), SCRIPT))), 'and the copy\'s own hash');
+  assert.doesNotMatch(report, /agent aligned/, 'and must not accuse the copy that is fine');
+
+  // And green when nothing is behind: drop the drifted copy.
+  fs.unlinkSync(path.join(laneDir('behind'), SCRIPT));
+  assert.deepEqual(divergentCopies(root, repoFile), [],
+    'a copy that matches is not a failure, and a missing copy is not a failure either');
 });
