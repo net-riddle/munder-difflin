@@ -123,15 +123,39 @@ licence restriction attached, and that is worth knowing before we invest in tuni
 
 ---
 
-## Two things the human should know before choosing
+## The hardware, verified — and it changes the reading of everything above
 
-**1. The ceiling is not the bottleneck, so this is not a ceiling decision.** `speakBudgetMs` grants
-2.5x what XTTS spends at 464 characters and 6.5x at 101. Nothing here requires touching it.
+I did not know what the voice server runs on, and guessed in the first version of this
+report. Measured, from inside the running container:
 
-**2. There is no GPU information in this report, and that may matter more than every number in it.**
-The voice server runs in a container I cannot inspect from here, so I do not know whether it has a
-GPU at all. If it is CPU-only, VRAM is irrelevant and the whole ranking turns on CPU speed — which
-favours Kokoro even more. **This is the first thing worth answering.**
+```
+container  openedai-speech-server-1   (up 18 hours)
+torch      2.6.0+cu124
+CUDA       available: True, device count: 1
+GPU        NVIDIA GeForce RTX 4060, 8.0 GB, capability 8.9
+```
+
+**And the model is already on it.** `speech.py:414` defaults `--xtts_device` to
+`auto_torch_device()`, which returns `cuda` when `torch.cuda.is_available()` — and it is,
+so XTTS is running on the RTX 4060. `speech.env` sets no device, and
+`docker-compose.yml:17-21` reserves all NVIDIA devices.
+
+**So RTF 2.5 is a GPU number, not a CPU one.** Three things follow, and they matter more
+than any ranking on this page:
+
+1. **The model is the bottleneck, not the hardware.** An RTX 4060 running XTTS at two and a
+   half times real time is slow for that card. Every CPU benchmark in circulation — including
+   the 5.31 that started this — is doubly irrelevant: wrong machine, wrong hardware class.
+2. **The 6 GB ceiling is real and it binds.** The card has 8 GB, so a model needing "6 GB
+   minimum" (F5-TTS) would consume three quarters of it and leave nothing for anything else.
+   Kokoro at 1.1–2.6 GB fits with room to spare; Chatterbox Turbo and Qwen3-TTS 0.6B are
+   plausible fits that would need confirming by trial.
+3. **There may be a cheaper win than changing model at all.** An RTX 4060 doing XTTS at 2.5x
+   realtime suggests headroom in the current setup before any replacement is considered —
+   precision, batching, warm-up. `speech.py:417` also notes `--use-deepspeed` is
+   "unsupported". I have not measured any of that, and `task-kelly-082` blocks changes to
+   the voice server until the human answers, so it stays a question rather than a plan.
+
 
 Also already settled, and it constrains any replacement: the server **serialises requests behind a
 lock**, so synthesising the three pieces of a message in parallel would gain nothing. Whatever
@@ -149,10 +173,16 @@ replaces XTTS has to keep answering one request at a time, and one request must 
    - **No, a good fixed Italian voice is fine** → **Kokoro-82M**, and the 111 s becomes about 5 s.
      The cost is named above: `if_sara` or `im_nicola`, and its author's own warning about thin
      non-English support.
-2. **Is there a GPU in the voice container, and is 6 GB a real ceiling on it?** If it is CPU-only,
-   say so and this report gets re-ranked on CPU speed alone.
-3. **Is a 20x speedup worth replacing the voice the office has today?** That is a product
-   judgement, not a technical one, and it is the only genuinely irreversible thing here.
+2. **A 20x speedup is worth replacing the office voice for?** A product judgement, not a
+   technical one, and the only genuinely irreversible thing here.
+3. **Before choosing a model: is the current one being used well?** An RTX 4060 running XTTS at
+   2.5x realtime says the **model** is the bottleneck; it does not say the **configuration** is
+   optimal. Precision, batching and warm-up are unmeasured, cheap and reversible — and they
+   set the baseline every candidate would be compared against. **A replacement chosen against
+   an untuned XTTS has been measured against the wrong opponent.**
+
+**The ceiling is not a factor in any of this:** `speakBudgetMs` already grants 2.5x at 464
+characters and 6.5x at 101, so nothing here requires touching it.
 
 **Nothing is installed, nothing is changed, and no model has been touched.** The next step is a
 card per candidate to trial, and it does not start until the human answers.
