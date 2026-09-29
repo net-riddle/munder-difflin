@@ -1236,3 +1236,69 @@ test('088: the lane never deletes an envelope, and the guard PROVES it can tell'
   // guard would push the next person towards never unlinking anything.
   assert.deepEqual(envelopeDeleters('unlinkSync(ps1); unlinkSync(tmp); unlinkSync(wav);'), []);
 });
+
+// ─── 088 again: nothing enters the queue without leaving a trace ──────────────
+//
+// The trace exists because of the case that cost a night: a message declared
+// queued that was never written, or written and then lost, and neither the queue
+// nor the receipts could say which. The answer is not a better investigation —
+// it is a record written at the only moment anyone can vouch for it: the moment
+// the message enters.
+
+test('088: queueing a message leaves a trace beside it, in the queue\'s own terms', () => {
+  const { mkdtempSync, readFileSync, existsSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'vo-088w-'));
+  const at = '2026-09-29T15:00:00.000Z';
+  const q = mod.queueMessage(dir, 'La 086 e chiusa e la regola e merged.', { now: () => at });
+
+  assert.ok(existsSync(join(dir, q.name)), 'the envelope is queued');
+  assert.ok(existsSync(q.marker), 'and so is the trace');
+  const marker = JSON.parse(readFileSync(q.marker, 'utf8'));
+  assert.equal(marker.envelope, q.name, 'the trace names the envelope it belongs to');
+  assert.equal(marker.writtenAt, at, 'and WHEN it was written, which is the whole point');
+  assert.equal(marker.chars, q.envelope.text.length);
+  assert.equal(marker.envelope, q.marker.split(/[\\/]/).pop().replace('.written.json', '.json'),
+    'the name is derivable from the trace, so a reader needs only the directory');
+});
+
+test('088: the trace is invisible to the queue, INCLUDING to a drainer that has never heard of it', () => {
+  const { mkdtempSync, writeFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'vo-088w-'));
+  mod.queueMessage(dir, 'Una riga senza particolari.');
+
+  assert.deepEqual(mod.pending(dir), [mod.pending(dir)[0]], 'exactly one thing is waiting, and it is the message');
+  const only = mod.pending(dir);
+  assert.equal(only.length, 1);
+  assert.match(only[0], /^msg-.*\.json$/);
+
+  // The hazard that decided the layout, asserted rather than remembered: a trace
+  // written BESIDE the envelope ends in .json and is a perfectly good message as
+  // far as any drainer is concerned — including the copy a running app executes,
+  // which may predate the trace entirely.
+  const naive = mkdtempSync(join(tmpdir(), 'vo-088n-'));
+  writeFileSync(join(naive, 'msg-1.json'), '{"v":1,"id":"msg-1","text":"Ciao."}', 'utf8');
+  writeFileSync(join(naive, 'msg-1.written.json'), '{"v":1}', 'utf8');
+  assert.equal(mod.pending(naive).length, 2,
+    'a sibling trace would be read as a message to speak — which is why it lives in a dot-directory');
+});
+
+test('088: if the trace cannot be written, the message does NOT enter the queue', () => {
+  // The direction that matters. A trace-less message is the case nobody could
+  // investigate; a stray trace of a message that never went is a file an operator
+  // can see and delete. So the queue gives up rather than take the first.
+  const { mkdtempSync, writeFileSync, existsSync, readdirSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'vo-088w-'));
+  writeFileSync(join(dir, mod.WRITTEN_DIR), 'not a directory', 'utf8');
+
+  assert.throws(() => mod.queueMessage(dir, 'Questa non deve entrare.'), /no trace|trace/i);
+  assert.deepEqual(mod.pending(dir), [], 'nothing is waiting: the message was refused');
+  assert.equal(readdirSync(dir).filter((n) => n.endsWith('.tmp')).length, 0,
+    'and no half-written envelope is left for the next reader to interpret');
+  assert.ok(existsSync(join(dir, mod.WRITTEN_DIR)), 'the obstacle is still there, untouched');
+});

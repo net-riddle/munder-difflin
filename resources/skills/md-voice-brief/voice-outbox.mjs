@@ -828,6 +828,63 @@ function isEnvelopeFile(name) {
   return name.endsWith('.json') && !name.startsWith('.') && !name.endsWith(RECEIPT_SUFFIX);
 }
 
+/**
+ * The trace that a message was ever written, and the directory it lives in.
+ *
+ * A dot-DIRECTORY, not a sibling file, and that is the whole design: a sibling
+ * `*.written.json` ends in `.json` and does not start with `.`, so every drainer
+ * that has never heard of the trace would read it as a message to speak — and
+ * the copy of this script a running app executes may well be yesterday's. Inside
+ * a dot-directory it is invisible by construction, to this version and to every
+ * older one, and the convention is already there: `isEnvelopeFile` has always
+ * skipped dotted names.
+ */
+export const WRITTEN_DIR = '.written';
+
+/** Where the trace of envelope `name` lives. */
+export function writtenMarkerPath(outbox, name) {
+  return join(outbox, WRITTEN_DIR, name.replace(/\.json$/, '') + '.written.json');
+}
+
+/**
+ * Put ONE message in the queue — and leave a trace that it was ever written.
+ *
+ * The trace is written BEFORE the envelope becomes visible, so the invariant is
+ * one-directional and therefore true: an envelope that is in the queue always
+ * has a trace. The reverse does not hold, and cannot: a crash between the two
+ * writes leaves a trace of a message nobody will ever read, which is a lie of
+ * the harmless kind — a stuck file the operator can see — while the other order
+ * would leave a message that no trace and no receipt can account for, which is
+ * the case that cost a night of hunting.
+ *
+ * If the trace cannot be written the envelope is NOT queued. The queue refuses to
+ * take a message it cannot account for, and the half-written temp file is
+ * removed rather than left for the next reader to interpret.
+ */
+export function queueMessage(outbox, text, { now = () => new Date().toISOString() } = {}) {
+  const at = now();
+  const id = `msg-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const env = { v: 1, id, text: normalizeSpoken(text), createdAt: at };
+  const name = `${id}.json`;
+  mkdirSync(outbox, { recursive: true });
+  const tmp = join(outbox, `.${id}.tmp`);
+  writeFileSync(tmp, JSON.stringify(env, null, 2), 'utf8');
+  const marker = writtenMarkerPath(outbox, name);
+  try {
+    mkdirSync(join(outbox, WRITTEN_DIR), { recursive: true });
+    writeFileSync(
+      marker,
+      JSON.stringify({ v: 1, envelope: name, id, writtenAt: at, chars: env.text.length }, null, 2),
+      'utf8'
+    );
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* the queue is clean either way */ }
+    throw new Error(`refusing to queue a message that would leave no trace: ${e.message}`);
+  }
+  renameSync(tmp, join(outbox, name));
+  return { name, envelope: env, marker };
+}
+
 /** Every envelope waiting to be spoken, oldest first by filename. */
 export function pending(outbox) {
   let names;
@@ -1106,16 +1163,12 @@ async function main(argv) {
         'speaks messages himself — send this one to god\'s inbox instead, or nothing will be heard twice.\n'
       );
     }
-    const id = `msg-${Date.now()}-${randomUUID().slice(0, 8)}`;
-    const env = { v: 1, id, text: normalizeSpoken(write), createdAt: new Date().toISOString() };
-    // Write-then-rename: a reader must never see a half-written envelope.
-    const tmp = join(outbox, `.${id}.tmp`);
-    writeFileSync(tmp, JSON.stringify(env, null, 2), 'utf8');
-    renameSync(tmp, join(outbox, `${id}.json`));
-    process.stdout.write(`${join(outbox, `${id}.json`)}\n`);
+    // The queue and the trace are one act, so they cannot come apart: a message
+    // that is in the queue is a message that left a record of being written.
+    const queued = queueMessage(outbox, write);
+    process.stdout.write(`${join(outbox, queued.name)}\n`);
     return 0;
   }
-
   const checkFile = arg('--check-file');
   if (checkFile !== null) {
     const report = checkSpokenText(readFileSync(checkFile, 'utf8'));
