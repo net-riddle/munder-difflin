@@ -193,6 +193,17 @@ export function validateEnvelope(env) {
   if (env.voice !== undefined && typeof env.voice !== 'string') {
     problems.push('voice must be a string when present');
   }
+  if (typeof env.text === 'string') {
+    // The same rule as the author-side check, enforced on the way OUT as well: an
+    // envelope can be written by hand, and the queue is the last place where
+    // refusing still costs the user nothing. Once this returns, the audio is
+    // already on its way and no code in this file can take a word back.
+    const names = findUnpronounceableNames(env.text);
+    if (names.length) {
+      const list = names.map((n) => `"${n.token}" -> "${n.say}"`).join(', ');
+      problems.push(`text names an agent by its registry id (${list}) — refused, not spoken: the outbox cannot be re-read`);
+    }
+  }
   if (typeof env.text === 'string' && env.text.length > MAX_SPOKEN_CHARS) {
     problems.push(`text is ${env.text.length} characters, over the ${MAX_SPOKEN_CHARS}-character ceiling on one message (about ${Math.ceil(env.text.length / MAX_PIECE_CHARS)} pieces)`);
   }
@@ -246,6 +257,15 @@ export function checkSpokenText(text) {
     add('path', `contains a file path (${paths[0].trim()}) — say what the file IS, not where it lives`);
   }
   if (/\b[0-9a-f]{7,}\b/i.test(t)) add('hash', 'contains what looks like a commit hash');
+
+  // A registry id is legible on a screen and unusable in an ear, and the ear
+  // cannot go back. Blocking, not a note: the fix is a word, and the author is
+  // the only one who can choose it.
+  const names = findUnpronounceableNames(t);
+  if (names.length) {
+    const list = names.map((n) => `"${n.token}" -> say "${n.say}"`).join(', ');
+    add('agent-id', `names an agent by its registry id, which no voice can pronounce: ${list}. Write the name the user calls them by`);
+  }
   if (/^[A-Z_]{3,}(\s|$)/m.test(t)) add('shout', 'contains a SHOUTED WORD, which the voice cannot convey');
   if (/\bTODO\b|\bFIXME\b|\bXXX\b/.test(t)) add('marker', 'contains a TODO/FIXME marker meant for a screen, not an ear');
 
@@ -262,6 +282,43 @@ export function checkSpokenText(text) {
 
   const hard = findings.filter((f) => !['long', 'blank-lines', 'edge-space', 'double-space'].includes(f.code));
   return { ok: hard.length === 0 && !!t.trim(), findings, blocking: hard };
+}
+
+/**
+ * The agent ids a voice cannot pronounce, and the name to say instead.
+ *
+ * The outbox is the only channel that cannot be re-read: by the time the listener
+ * has finished translating the first half of the token, the word is spent, and
+ * there is no second attempt. So an id is refused rather than spoken.
+ *
+ * The rule is the id's SHAPE, not a list of names, because a list is only correct
+ * until the next agent spawns: every generated id is `<name>-<suffix>`, and the
+ * suffix is long AND carries a digit. That digit is what keeps `screen-reader`,
+ * `long-form` and `short-circuit` out — a suffixed token with no digit in it is
+ * an English word, and a message must never be blocked by a word.
+ *
+ * `god` is written out by hand because nothing structural can find it: it is the
+ * one id with no suffix. The name the user hears is his, not the registry's.
+ */
+const SUFFIXLESS_ID_NAMES = { god: 'Michael' };
+const AGENT_ID = /\b([a-z][a-z0-9]{1,15})-([a-z0-9]{6,10})\b/gi;
+
+export function findUnpronounceableNames(text) {
+  const t = String(text ?? '');
+  const found = [];
+  const add = (token, say) => {
+    if (!found.some((f) => f.token === token)) found.push({ token, say });
+  };
+  for (const m of t.matchAll(AGENT_ID)) {
+    const [, name, suffix] = m;
+    if (!/\d/.test(suffix)) continue;
+    add(m[0], name[0].toUpperCase() + name.slice(1));
+  }
+  for (const m of t.matchAll(/\b([a-z]+)\b/gi)) {
+    const say = SUFFIXLESS_ID_NAMES[m[1].toLowerCase()];
+    if (say) add(m[0], say);
+  }
+  return found;
 }
 
 /**
@@ -994,11 +1051,13 @@ export function describeFlush(r) {
     return s ? `, ${s}` : '';
   };
   if (r.ok) {
-    // When the app's watcher filed this envelope first, say so. The message WAS
-    // spoken by this process — the audio already reached the user — so this is
-    // not a failure line, and it stays on stdout. But it is not silence either:
-    // two drains of one queue is a fact somebody has to be able to see, and the
-    // receipt that proves it belongs to the other drainer.
+    // When the app's watcher filed this envelope first, say so. The message was
+    // spoken — by the OTHER drainer, not by this process: this one found the
+    // envelope already moved and its receipt already written, so it played
+    // nothing. The user still heard it exactly once, which is why this is a
+    // success and stays on stdout. But it is not silence either: two drains of one
+    // queue is a fact somebody has to be able to see, and the timings printed
+    // here are the other drainer's measurements, not this process's.
     const raced = r.receipt && r.receipt.racedBy ? ' (the app watcher filed it first)' : '';
     return { stream: 'stdout', text: `spoke ${r.name} (${r.chars} chars, ${plural(r.pieces)}${took(r.totalMs)}${perPiece(r.results)})${raced}\n` };
   }

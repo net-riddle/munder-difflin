@@ -1105,3 +1105,88 @@ test('083: the guard is the RECEIPT, not the error code — same ENOENT, both wa
   // the mistake this test exists to catch.
   assert.equal(ok.ok && threw, true, 'same ENOENT, opposite verdicts, decided by the receipt alone');
 });
+
+// ─── 086: the outbox is the one channel that cannot be re-read ───────────────
+//
+// An agent id in a spoken message forces the listener to TRANSLATE a string
+// before they can think about the sentence, and there is no rewinding: the word
+// is already spent. Everywhere else a long id is only ugly; here it is a cost
+// paid by the human, in the dark, at the moment the message arrives.
+//
+// So the rule is REFUSAL, not substitution. That is the whole reason the word
+// and the mouth are two different people: the author is the only one who can
+// choose the name, and this lane is the last place where refusing is still free.
+
+test('086: an agent id is refused, and the author is told what to say instead', () => {
+  const r = mod.checkSpokenText('Jim ha lasciato la 083 in coda per jim-mugp1eoh.');
+  assert.equal(r.ok, false, 'a registry id in a spoken message is not ok');
+  const p = r.blocking.find((f) => f.code === 'agent-id');
+  assert.ok(p, 'expected a blocking agent-id finding');
+  assert.match(p.detail, /jim-mugp1eoh/, 'the offending token is quoted back');
+  assert.match(p.detail, /say "Jim"/, 'and so is the name to write');
+});
+
+test('086: the rule is the id SHAPE, so an id nobody wrote down is caught too', () => {
+  // Not a list of three known names: `zoe` has never existed on this floor, and a
+  // list would have passed it. The suffix is what carries the rule.
+  const r = mod.checkSpokenText('zoe-abc123xy ha chiuso la card.');
+  assert.ok(r.blocking.some((f) => f.code === 'agent-id'), 'a future id must be caught too');
+});
+
+test('086: a hyphenated English word is not an id, and does not block the message', () => {
+  // The other side of the same rule, and the reason the suffix must carry a
+  // digit: a message must never be blocked because of a word.
+  for (const text of [
+    'The screen-reader path still works.',
+    'Il long-form e una delle misure del rapporto.',
+    'Uno short-circuit coalesce i pezzi.'
+  ]) {
+    const r = mod.checkSpokenText(text);
+    assert.ok(!r.findings.some((f) => f.code === 'agent-id'), `must not flag: ${text}`);
+  }
+});
+
+test('086: `god` is caught by hand, and the name the user hears is his own', () => {
+  // The one id with no suffix, so no shape can find it. What matters is that the
+  // suggestion is the human's name: the queue is where HE is listening.
+  const r = mod.checkSpokenText('god ha chiuso la 084 e il canale resta aperto.');
+  const p = r.blocking.find((f) => f.code === 'agent-id');
+  assert.ok(p, 'expected god to be refused');
+  assert.match(p.detail, /"god" -> say "Michael"/);
+});
+
+test('086: the simplified names are exactly the good case, and pass clean', () => {
+  const r = mod.checkSpokenText('Jim ha lasciato la 083 in coda, Pam ha chiuso la 053.');
+  assert.ok(!r.findings.some((f) => f.code === 'agent-id'), JSON.stringify(r.findings));
+});
+
+test('086: the envelope is refused on the way OUT, before any audio is asked for', () => {
+  const r = mod.validateEnvelope({ v: 1, id: 'msg-1', text: 'Kelly ha finito: kelly-multwfg2.' });
+  assert.equal(r.ok, false, 'a hand-written envelope must not pass either');
+  assert.match(r.problems.join(' '), /kelly-multwfg2/);
+  assert.match(r.problems.join(' '), /Kelly/);
+});
+
+test('086: flushOne does not SPEAK an id — it files it, and says why', async () => {
+  // The acceptance criterion of the card, end to end: it does not go out as it
+  // is. The load-bearing assertion is the last one — no request was made, so
+  // there was no audio to be un-sent afterwards.
+  const { mkdtempSync, writeFileSync, existsSync, readdirSync, readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'vo-086-'));
+  const name = 'msg-086.json';
+  writeFileSync(join(dir, name), JSON.stringify({ v: 1, id: 'msg-086', text: 'pam-mul0lzyj ha chiuso la 053.', createdAt: 'now' }), 'utf8');
+  let asked = 0;
+  const fetchImpl = async () => { asked++; return new Response(realWav(), { status: 200 }); };
+  const r = await mod.flushOne(dir, name, { userData: dir, fetchImpl, platform: 'win32' });
+  assert.equal(r.ok, false);
+  assert.equal(r.outcome, 'rejected');
+  assert.ok(existsSync(join(dir, '.failed', name)), 'the envelope is preserved, not deleted');
+  assert.ok(!existsSync(join(dir, '.done')), 'nothing was spoken, so nothing may be marked done');
+  assert.equal(asked, 0, 'the message must never reach the speech server');
+  assert.equal(readdirSync(dir).length, 1, 'and it leaves the queue');
+  const receipt = JSON.parse(readFileSync(join(dir, '.failed', mod.receiptName(name)), 'utf8'));
+  assert.equal(receipt.outcome, 'rejected');
+  assert.match(receipt.error, /pam-mul0lzyj/, 'the receipt says which token stopped it');
+});
