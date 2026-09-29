@@ -291,17 +291,26 @@ export function checkSpokenText(text) {
  * has finished translating the first half of the token, the word is spent, and
  * there is no second attempt. So an id is refused rather than spoken.
  *
- * The rule is the id's SHAPE, not a list of names, because a list is only correct
- * until the next agent spawns: every generated id is `<name>-<suffix>`, and the
- * suffix is long AND carries a digit. That digit is what keeps `screen-reader`,
- * `long-form` and `short-circuit` out — a suffixed token with no digit in it is
- * an English word, and a message must never be blocked by a word.
+  * The rule is the id's SHAPE, not a list of names, because a list is only correct
+  * until the next agent spawns: every generated id is `<name>-<suffix>`, and the
+  * suffix is long AND carries a digit. That digit is what keeps `screen-reader`,
+  * `long-form` and `short-circuit` out — a suffixed token with no digit in it is
+  * an English word, and a message must never be blocked by a word. The length of
+  * the suffix is deliberately NOT a boundary: see `AGENT_ID` below.
  *
  * `god` is written out by hand because nothing structural can find it: it is the
  * one id with no suffix. The name the user hears is his, not the registry's.
  */
 const SUFFIXLESS_ID_NAMES = { god: 'Michael' };
-const AGENT_ID = /\b([a-z][a-z0-9]{1,15})-([a-z0-9]{6,10})\b/gi;
+// The suffix has NO upper bound on purpose. It used to be `{6,10}`, a range
+// fitted to the four ids that existed when it was written, and a range fitted to
+// a sample is a rule about the numbers rather than about the thing: an id with a
+// 5- or an 11-character suffix walked straight through it. The DISCRIMINATOR is
+// the digit, checked below — a random hex suffix carries one, and an English
+// word never does. `{5,}` is only a floor to keep `sha-256` and `utf-8`, which
+// are digits with no letters, out of the shape; the digit test is what does the
+// real work.
+const AGENT_ID = /\b([a-z]{2,15})-([a-z0-9]{5,})\b/gi;
 
 export function findUnpronounceableNames(text) {
   const t = String(text ?? '');
@@ -311,7 +320,10 @@ export function findUnpronounceableNames(text) {
   };
   for (const m of t.matchAll(AGENT_ID)) {
     const [, name, suffix] = m;
-    if (!/\d/.test(suffix)) continue;
+    // A digit AND a letter. The letter keeps `sha-256` out; the digit keeps
+    // `screen-reader` and `long-form` out. A message must never be blocked by a
+    // word, and must never speak an id.
+    if (!/\d/.test(suffix) || !/[a-z]/.test(suffix)) continue;
     add(m[0], name[0].toUpperCase() + name.slice(1));
   }
   for (const m of t.matchAll(/\b([a-z]+)\b/gi)) {

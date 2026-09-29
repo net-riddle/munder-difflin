@@ -1160,6 +1160,44 @@ test('086: the simplified names are exactly the good case, and pass clean', () =
   assert.ok(!r.findings.some((f) => f.code === 'agent-id'), JSON.stringify(r.findings));
 });
 
+test('092: the id shape is not a length range - the digit is the discriminator', () => {
+  // The suite the rule used to pass: the four ids that existed when it was
+  // written, all with an 8-character suffix. Every one is still caught.
+  for (const id of ['jim-mugp1eoh', 'kelly-multwfg2', 'pam-mul0lzyj']) {
+    assert.ok(mod.checkSpokenText(`${id} ha chiuso la card.`).findings.some((f) => f.code === 'agent-id'),
+      `${id} is an agent id and must not be spoken`);
+  }
+
+  // The hole: the suffix used to be bounded to 6-10, which was a range fitted to
+  // the sample above rather than a rule about ids. Both ends of the hole are
+  // refused now, and a 5-character suffix is the shortest that carries both a
+  // digit and a letter.
+  for (const id of ['jim-abcde1', 'jim-abcdefghijk1', 'jim-abcdefghijklmno1']) {
+    assert.ok(mod.checkSpokenText(`${id} ha chiuso la card.`).findings.some((f) => f.code === 'agent-id'),
+      `${id} is outside the old 6-10 range and must still be refused`);
+  }
+
+  // And the other direction, which is the cost of a wider net: a message must
+  // never be blocked by a word, nor by a legitimate piece of engineering. These
+  // are the strings a wider rule would have caught by accident.
+  for (const phrase of [
+    'Usa la chiave sha-256 per il checksum.',
+    'Il file e\' in utf-8, non in latin-1.',
+    'La modalità short-circuit non è quella di long-form.',
+    'Riga release-notes e anche well-known, per completezza.',
+    'Il range 3-5 è sbagliato, va da 3 a 5.'
+  ]) {
+    assert.ok(!mod.checkSpokenText(phrase).findings.some((f) => f.code === 'agent-id'),
+      `must pass clean, it is not an id: ${phrase}`);
+  }
+
+  // The names the human actually chose are not what makes this work: `god` is
+  // handled by the suffixless table, and the shape above has never heard of it.
+  // So a fifth agent needs no new rule, which is the point of the shape.
+  assert.ok(mod.checkSpokenText('god ha chiuso la card.').findings.length > 0,
+    'god is caught by the suffixless table, not by the shape');
+});
+
 test('086: the envelope is refused on the way OUT, before any audio is asked for', () => {
   const r = mod.validateEnvelope({ v: 1, id: 'msg-1', text: 'Kelly ha finito: kelly-multwfg2.' });
   assert.equal(r.ok, false, 'a hand-written envelope must not pass either');
@@ -1235,6 +1273,82 @@ test('088: the lane never deletes an envelope, and the guard PROVES it can tell'
   // The other direction: the temp files it DOES clean up must stay legal, or the
   // guard would push the next person towards never unlinking anything.
   assert.deepEqual(envelopeDeleters('unlinkSync(ps1); unlinkSync(tmp); unlinkSync(wav);'), []);
+});
+
+// ─── 092: the trace's reach, which is `--write` and not the directory ─────────
+//
+// The claim `4d17bd0a` put in its SUBJECT is "nothing enters the queue without
+// leaving a trace", and its body correctly says `--write` is the path. The
+// subject is the part that stays in memory, so the subject is the part that has
+// to be right.
+//
+// So this guard is the mirror of the one above: that one enumerates who can
+// DELETE an envelope, this one enumerates who can PUBLISH one. The trace
+// invariant holds exactly while there is one publisher, it is `queueMessage`,
+// and the trace is written before it. A second publisher — a second CLI verb, a
+// helper, a retry that re-creates the file — would make the subject true only
+// sometimes, with no test to say so.
+function envelopePublishers(source) {
+  // Every call that makes a file appear where a drainer will look for a message
+  // to speak: a rename INTO a queue directory. `.tmp` sources are excluded
+  // because the rename is what publishes, not the write that staged it.
+  const out = [];
+  for (const m of String(source).matchAll(/\brenameSync\s*\(\s*[^,]+,\s*([^)]+)\)/g)) {
+    const dest = m[1];
+    // Into the queue root or into a state dir. Both are "the message is now
+    // here, speak it"; only the first is a new message entering.
+    if (/join\(\s*(outbox|to)\b/.test(dest)) out.push({ dest: dest.trim() });
+  }
+  return out;
+}
+
+test('092: exactly one thing can publish a message, and it writes the trace first', () => {
+  const source = fs.readFileSync(MODULE_PATH, 'utf8');
+
+  const publishers = envelopePublishers(source);
+  // One publisher into the queue ROOT (a new message), plus the one exit into
+  // .done/.failed (a message that was already spoken). Anything else is a
+  // second way in, and the subject of 4d17bd0a stops being true.
+  const entering = publishers.filter((p) => /join\(\s*outbox\b/.test(p.dest));
+  const exiting = publishers.filter((p) => /join\(\s*to\b/.test(p.dest));
+  assert.equal(entering.length, 1,
+    `exactly one publisher enters the queue, and it is queueMessage: ${JSON.stringify(publishers)}`);
+  assert.equal(exiting.length, 1,
+    `and exactly one rename is the exit into .done/.failed: ${JSON.stringify(publishers)}`);
+
+  // Direction matters and is the reason the trace is written first: the trace
+  // must appear in the source BEFORE the rename that publishes the envelope.
+  // Asserting the two exist is not enough — the ORDER is the whole invariant,
+  // and the reverse order leaves a message no record can account for.
+  const traceAt = source.indexOf('written.json');
+  const publishAt = source.indexOf('renameSync(tmp, join(outbox, name));');
+  assert.ok(traceAt > 0 && publishAt > 0, 'both the trace and the publishing rename are present');
+  assert.ok(traceAt < publishAt,
+    'the trace is written BEFORE the envelope becomes visible — that is what makes "in the queue => has a trace" true');
+
+  // The half that makes the assertions above worth anything. A second
+  // publisher is the exact defect 092 is about, and it must be visible: fed a
+  // source that publishes an envelope a second way, the same function must
+  // find it. A guard that has never seen its own failure is a comment with an
+  // exit code — and `.written/` had never existed in the real queue, so this
+  // one had never bitten anyone, including me.
+  const mutated = source.replace(
+    'renameSync(tmp, join(outbox, name));',
+    `renameSync(tmp, join(outbox, name));
+  renameSync(staged2, join(outbox, name2));`
+  );
+  assert.notEqual(mutated, source, 'the mutation must actually apply, or the proof is theatre');
+  const foundEntering = envelopePublishers(mutated).filter((p) => /join\(\s*outbox\b/.test(p.dest));
+  assert.equal(foundEntering.length, 2, JSON.stringify(foundEntering));
+  assert.ok(foundEntering.some((p) => /name2/.test(p.dest)),
+    'and it names the second route that publishes without a trace');
+
+  // The reverse direction: the exit must stay legal, or this guard would push
+  // the next person towards never renaming anything. The captured destination
+  // stops at the first `)` — that is what this parser does, asserted here
+  // rather than left for the next reader to discover as a surprise.
+  assert.deepEqual(envelopePublishers('renameSync(tmp, join(outbox, name));'), [{ dest: 'join(outbox, name' }]);
+  assert.deepEqual(envelopePublishers('renameSync(tmp, join(to, name));'), [{ dest: 'join(to, name' }]);
 });
 
 // ─── 088 again: nothing enters the queue without leaving a trace ──────────────
