@@ -48,11 +48,37 @@ function piano(t) {
     fs.writeFileSync(p, contenuto, 'utf8');
     return p;
   };
-  // Recomputed per call on purpose: these fixtures are a handful of files, and a
-  // plan that a test could only see once would hide a second caller's behaviour.
-  const p = () => costruisciPiano({ roots: [home], dichiarati: new Set(), nomiLetti: new Set() });
-  return { home, scrivi, p, proposte: () => p().proposte, protetti: () => p().protetti };
+  // `carte` is passed explicitly so the fixtures never depend on the floor's real
+  // ledger — and `ok: true` says "I read it and there are no open cards", which is
+  // a different statement from "I could not read it". The test below is about that
+  // difference, and a fixture that blurred it would be testing nothing.
+  const carte = { ok: true, carte: [], motivo: '' };
+  const p = (extra) => costruisciPiano({ roots: [home], dichiarati: new Set(), nomiLetti: new Set(), carte, ...extra });
+  return { home, scrivi, carte, p, proposte: () => p().proposte, protetti: () => p().protetti };
 }
+
+// ── 7. a tool that cannot see the rules must assume they forbid it ─────────
+
+test('100: a ledger that cannot be read makes the plan EMPTY, not wide open', (t) => {
+  const { scrivi } = piano(t);
+  // Two genuinely identical copies: on a readable ledger this IS a real proposal.
+  const fonte = scrivi('resources/skills/z/skill.md', CONTENUTO);
+  const copia = scrivi('agents/jim/.claude/skills/z/skill.md', CONTENUTO);
+  const { costruisciPiano: _ } = {};
+
+  const carteRotte = { ok: false, carte: [], motivo: 'NON RIESCO A LEGGERE tasks.json' };
+  const pianoRotto = costruisciPiano({
+    roots: [path.dirname(fonte)], dichiarati: new Set(), nomiLetti: new Set(), carte: carteRotte
+  });
+
+  assert.equal(pianoRotto.proposte.length, 0,
+    'THE PLAN GOES TO ZERO. `chain.cjs` writes the ledger in place with a plain writeFileSync, so a reader during a write sees a truncated file — tonight\'s own ledger did exactly that. Returning an empty card list there would mean answering «no open card declares anything» FROM A FILE THAT FAILED TO READ, and that is the claim `fuori uso` is built on. *A tool that cannot see the rules must assume the rules forbid it, because the alternative is a tool that assumes nobody set any.*');
+  assert.ok(pianoRotto.protetti.some((p) => p.path === fonte),
+    'and the reason travels with the file, so the manifest says WHY nothing was proposed instead of just proposing nothing');
+  assert.ok(pianoRotto.protetti.some((p) => p.perche.includes('NON RIESCO A LEGGERE')),
+    'the reason is the ledger, verbatim, not a shrug');
+  assert.ok(copia, 'the copy still exists, which is the only thing that really matters here');
+});
 
 // ── 1. THE CASE THAT MUST NEVER HAPPEN ─────────────────────────────────────
 

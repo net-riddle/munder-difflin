@@ -147,12 +147,30 @@ function percorsiDichiarati(cardAperte) {
   return fuori;
 }
 
+/**
+ * The open cards, or a refusal.
+ *
+ * `chain.cjs` writes `tasks.json` with a plain `writeFileSync` **in place** — not a
+ * temp file and a rename — so a reader that arrives during a write sees a
+ * TRUNCATED file. That is not theoretical: reading the floor's own ledger tonight
+ * returned "Unexpected end of JSON input", and five seconds later the same file was
+ * valid and had grown by 175 bytes.
+ *
+ * Which is why the catch here does NOT return an empty list. An empty list is the
+ * answer that makes this skill least careful — "no open card declares anything" is
+ * exactly the claim that `fuori uso` is built on, and it would be a claim made from
+ * a file we failed to read. *A tool that cannot see the rules must assume the rules
+ * forbid it, because the alternative is a tool that assumes nobody set any.*
+ */
 function carteAperte() {
   try {
     const t = JSON.parse(readFileSync(join(HIVE, 'tasks.json'), 'utf8'));
     const a = t.tasks || t;
-    return Array.isArray(a) ? a.filter((c) => c && c.status !== 'done' && c.status !== 'cancelled') : [];
-  } catch { return []; }
+    if (!Array.isArray(a)) return { ok: false, carte: [], motivo: 'tasks.json non contiene un elenco di card' };
+    return { ok: true, carte: a.filter((c) => c && c.status !== 'done' && c.status !== 'cancelled'), motivo: '' };
+  } catch (e) {
+    return { ok: false, carte: [], motivo: 'NON RIESCO A LEGGERE tasks.json (' + e.message + '): finche\' non lo leggo non posso sapere che cosa dichiarano le card aperte, e cio\' vale come «non dichiarato da nessuna», che e\' la risposta che rende questo strumento MENO cauto' };
+  }
 }
 
 /**
@@ -203,8 +221,11 @@ function fuoriUso(p, ctx) {
  */
 export function costruisciPiano(opts = {}) {
   const roots = opts.roots || ROOTS;
+  const carte = opts.carte === undefined ? carteAperte() : opts.carte;
   const ctx = {
-    dichiarati: opts.dichiarati || percorsiDichiarati(carteAperte()),
+    carteOk: carte.ok,
+    motivoLedger: carte.motivo,
+    dichiarati: opts.dichiarati || percorsiDichiarati(carte.carte),
     nomiLetti: opts.nomiLetti || indiceNomiLetti(),
     hashPerSha: new Map(),     // sha -> [paths]
     file: [],
@@ -302,6 +323,7 @@ function percheProtetto(p, ctx) {
     return 'la skill non e\' un proprio residuo: se si include, la prossima esecuzione cerca di cancellare se\' stessa';
   }
   if (ctx.dichiarati.has(nome)) return 'una card aperta lo dichiara';
+  if (ctx.carteOk === false) return ctx.motivoLedger;
   return null;
 }
 
