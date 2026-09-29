@@ -80,6 +80,11 @@ const COPY_DIRS = ['.opencode', '.claude', 'out', 'dist'];
 /** The floor's own memory. Deleting these is not tidying, it is amnesia. */
 const MAI_PER_NOME = new Set([
   'tasks.json', 'tasks.archive.json', 'log.jsonl', 'registry.json', 'fleet.json',
+  // il verbale delle chiusure: append-only e l'unica traccia di un controllo
+  // post-scrittura andato rosso, perche' il ledger non lo registra e il processo lo
+  // dice solo a chi sta guardando il terminale in quel momento. Una traccia che il
+  // ripulitore puo' cancellare non e' una traccia, quindi il nome e' qui.
+  'chiusure.jsonl',
   // mine, and declared as mine: an agent without its memory is a new agent
   'identity.md', 'memory.md',
   // the skill must never be a candidate for its own deletion
