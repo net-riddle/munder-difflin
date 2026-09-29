@@ -26,6 +26,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **The app no longer dies on launch under `npm run dev`.** Starting the dev server produced
+  `Cannot find module './tts-budget.cjs'` and a blank window. The raw `.cjs` helpers the main process
+  loads at runtime were listed in two places — the build script and the vite hook that runs in dev —
+  and only the build script knew about the newest one, so dev emitted a bundle that required a file
+  nobody copied. The list is written down once now and both paths read it, and a test fails at review
+  time if a helper is required but not listed, rather than at boot.
 - **A failed voice session no longer hides why.** Pressing Talk could report
   `Failed to execute 'setRemoteDescription'` — a WebRTC call that was working perfectly, named as
   the cause of an HTTP refusal that was silently discarded. The refused response's status and
