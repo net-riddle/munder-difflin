@@ -12,9 +12,19 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const loadTs = require('./load-ts.cjs');
+const { withHome } = require('./home-sandbox.cjs');
 
 const { expandTilde, statAbs } = loadTs('src/main/fs.ts');
 
+/**
+ * The twelve tests below are PURE: they compare `expandTilde(...)` against
+ * `path.join(HOME, ...)`, and both sides call `os.homedir()` in the same
+ * process, so they agree no matter whose home it is. The real home's identity
+ * never enters the verdict, which is why they are left alone — sandboxing them
+ * would be motion, not a fix. The one test that WRITES is the last one, and it
+ * is wrapped: it used to leave `.md-statabs-<pid>` in the developer's home if
+ * the process died.
+ */
 const HOME = os.homedir();
 
 test('expands the tilde-home forms', () => {
@@ -115,11 +125,16 @@ test('#140: both entry points agree on the same directory', () => {
   assert.equal(expandTilde(typed), normalizeHiveHome(typed).home);
 });
 
-test('statAbs expands bare ~, Windows-style ~\\, and whitespace paths', async () => {
-  const fileBasename = `.md-statabs-${process.pid}`;
-  const inHome = path.join(HOME, fileBasename);
-  fs.writeFileSync(inHome, 'x');
-  try {
+test('statAbs expands bare ~, Windows-style ~\\, and whitespace paths', () => {
+  // Sandboxed: this is the only test in the file that created anything, and it
+  // created it in the developer's home. Under a temporary home the proof is
+  // unchanged — `~/<name>` must resolve to a real file INSIDE a home, not to a
+  // directory literally named `~` — and the directory is removed even if the
+  // process dies. `home` is the sandboxed home, NOT the module-level HOME.
+  return withHome(async (home) => {
+    const fileBasename = `.md-statabs-${process.pid}`;
+    const inHome = path.join(home, fileBasename);
+    fs.writeFileSync(inHome, 'x');
     const resSlash = await statAbs(`~/${fileBasename}`);
     assert.equal(resSlash.exists, true);
     assert.equal(resSlash.isFile, true);
@@ -131,7 +146,5 @@ test('statAbs expands bare ~, Windows-style ~\\, and whitespace paths', async ()
     const resPadded = await statAbs(` ~/${fileBasename} `);
     assert.equal(resPadded.exists, true);
     assert.equal(resPadded.isFile, true);
-  } finally {
-    fs.rmSync(inHome, { force: true });
-  }
+  });
 });

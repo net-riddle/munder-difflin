@@ -23,6 +23,23 @@
  * write into someone's home. `hive-hook-node.test.cjs` already does this inline;
  * this is the same guard, named once, so the next test uses it instead of
  * re-deriving which knob matters on which platform.
+ *
+ * WHY IT IS NOT `async`. Every caller that existed when this was written was
+ * synchronous, and a plain `try/finally` around `return run(home)` restores the
+ * environment and deletes the temporary directory the moment `run` RETURNS — not
+ * when it SETTLES. Measured here, with a body that awaits:
+ *
+ *   sync phase    os.homedir() === SANDBOX
+ *   after await   os.homedir() === REAL   (C:\Users\danil)
+ *   temp home still on disk: false
+ *
+ * So an async test gets the real home back halfway through, with its own
+ * directory already removed underneath it. That is the worst outcome available
+ * and it is silent: the test believes it is sandboxed, and it is not. So the
+ * two cases are told apart by what `run` returned — a thenable means the work is
+ * still in flight, and restoring before it finishes is the bug. The synchronous
+ * path stays fully synchronous, so the callers that predate this keep restoring
+ * before their own `test()` body returns.
  */
 
 const fs = require('node:fs');
@@ -38,25 +55,45 @@ const path = require('node:path');
 function withHome(run, { prefix = 'md-home-' } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const before = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
-  process.env.HOME = home;
-  process.env.USERPROFILE = home;
-  try {
-    // The check is the point. A sandbox that did not take is not a slow sandbox,
-    // it is no sandbox, and the code under test will be handed the real home.
-    if (path.resolve(os.homedir()) !== path.resolve(home)) {
-      throw new Error(
-        `home redirect did not take: os.homedir() is ${os.homedir()}, not ${home}. ` +
-        'Refusing to run, because everything below would touch the real home.'
-      );
-    }
-    return run(home);
-  } finally {
+  const restore = () => {
     for (const k of ['HOME', 'USERPROFILE']) {
       if (before[k] === undefined) delete process.env[k];
       else process.env[k] = before[k];
     }
     fs.rmSync(home, { recursive: true, force: true });
+  };
+
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  // The check is the point. A sandbox that did not take is not a slow sandbox,
+  // it is no sandbox, and the code under test will be handed the real home.
+  if (path.resolve(os.homedir()) !== path.resolve(home)) {
+    const where = os.homedir();
+    restore();
+    throw new Error(
+      `home redirect did not take: os.homedir() is ${where}, not ${home}. ` +
+      'Refusing to run, because everything below would touch the real home.'
+    );
   }
+
+  let out;
+  try {
+    out = run(home);
+  } catch (err) {
+    restore();
+    throw err;
+  }
+
+  // A thenable means the work is still in flight: restoring now would hand the
+  // test the real home and delete its own directory mid-run. See the header.
+  if (out && typeof out.then === 'function') {
+    return out.then(
+      (value) => { restore(); return value; },
+      (err) => { restore(); throw err; }
+    );
+  }
+  restore();
+  return out;
 }
 
 module.exports = { withHome };
