@@ -88,10 +88,12 @@ function evaluator(src, names) {
 const afterLiteral = postedPayload("'tool.execute.after': async");
 const beforeLiteral = postedPayload("'tool.execute.before': async");
 const piResultLiteral = postedPayload("pi.on('tool_result'");
+const piCallLiteral = postedPayload("pi.on('tool_call'");
 
 const sendAfter = evaluator(afterLiteral, ['input', 'output']);
 const sendBefore = evaluator(beforeLiteral, ['input', 'output']);
 const sendPiResult = evaluator(piResultLiteral, ['ev', 'input', 'output']);
+const sendPiCall = evaluator(piCallLiteral, ['ev', 'AUTO']);
 
 // the agy shim builds `payload` rather than calling post(). Anchor on the
 // declaration itself: `agy.toolCall || {}` also contains braces, and grabbing
@@ -127,6 +129,58 @@ test('every PostToolUse producer on the floor carries tool_input', () => {
   assert.deepEqual(p.tool_input, { path: 'x' }, 'pi tool_result lost the input');
 });
 
+test('the pi tool_call producer carries tool_input too, like its own sibling', () => {
+  // Two lines apart in the same emitted string, one with the `?? {}` and one
+  // without. Nothing pins them to each other, so the pair drifted and the
+  // PreToolUse key was ELIDED by JSON.stringify — the key simply never reached
+  // the socket, with nothing in the payload saying it was missing.
+  const p = sendPiCall({ name: 'read', args: { path: 'x' } }, false);
+  assert.deepEqual(p.tool_input, { path: 'x' }, 'pi tool_call lost the input');
+});
+
+test('the two pi producers cannot disagree about the same event', () => {
+  // The invariant, stated once so it holds for every future edit: the two hooks
+  // in one extension present the SAME shape for the SAME event object. A
+  // disagreement here is invisible downstream — one caller sees a value and the
+  // other sees a hole, and both read as "no input".
+  for (const ev of [
+    { name: 'read', args: { path: 'x' } },
+    { name: 'read' },                    // no args at all
+    { name: 'read', args: null, input: { q: 1 } },
+    { name: 'read', args: undefined },
+    {}                                    // a bare event
+  ]) {
+    const pre = sendPiCall(ev, false);
+    const post = sendPiResult(ev);
+    assert.equal('tool_input' in pre, 'tool_input' in post,
+      `the key is present on one hook and absent on the other for ${JSON.stringify(ev)}`);
+    assert.deepEqual(pre.tool_input, post.tool_input,
+      `the two hooks disagree about the value for ${JSON.stringify(ev)}`);
+  }
+});
+
+test('a pi tool_call with no args still sends the KEY, and survives the wire', () => {
+  // The elision is the whole defect: `tool_input: ev && (ev.args || ev.input)`
+  // evaluates to undefined, and JSON.stringify DROPS an undefined key rather
+  // than sending a null. So the receiver gets a payload with a hole, and cannot
+  // tell that from a field that does not exist.
+  const p = sendPiCall({ name: 'todo' }, false);
+  assert.ok('tool_input' in p, 'the key must be present, not dropped by stringify');
+  assert.deepEqual(p.tool_input, {}, 'missing args must normalise to {}');
+  assert.ok(JSON.stringify(p).includes('"tool_input":{}'), 'and must survive the wire');
+});
+
+test('a pi tool_call with NO EVENT OBJECT at all still sends a comparable value', () => {
+  // `ev` can be absent entirely on this API (the sibling already guards for it,
+  // which is how the asymmetry was visible in the first place).
+  for (const ev of [undefined, null]) {
+    const p = sendPiCall(ev, false);
+    assert.notEqual(p.tool_input, undefined, `ev=${ev}: undefined is NOT comparable`);
+    assert.notEqual(p.tool_input, null, `ev=${ev}: null is NOT comparable`);
+    assert.ok('tool_input' in p, `ev=${ev}: the key must still reach the wire`);
+  }
+});
+
 test('a tool with no arguments still sends a COMPARABLE value, not nothing', () => {
   // The subtle one. `tool_input: tc.args` with args undefined is ELIDED by
   // JSON.stringify, so the key never reaches the socket and the breaker is
@@ -141,7 +195,8 @@ test('a call with no args anywhere is still comparable end to end', () => {
   for (const [label, payload] of [
     ['after', sendAfter({ tool: 'todo' }, undefined)],
     ['before', sendBefore({ tool: 'todo' }, {})],
-    ['pi', sendPiResult({ name: 'todo' })]
+    ['pi result', sendPiResult({ name: 'todo' })],
+    ['pi call', sendPiCall({ name: 'todo' }, false)]
   ]) {
     assert.notEqual(payload.tool_input, undefined, label + ': undefined is NOT comparable');
     assert.notEqual(payload.tool_input, null, label + ': null is NOT comparable');

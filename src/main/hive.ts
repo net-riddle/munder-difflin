@@ -3013,7 +3013,7 @@ function register(pi) {
   if (!pi || typeof pi.on !== 'function') return false;
   try {
     pi.on('tool_call', function (ev) {
-      post({ hook_event_name: 'PreToolUse', tool_name: ev && (ev.name || (ev.tool && ev.tool.name)), tool_input: ev && (ev.args || ev.input) });
+      post({ hook_event_name: 'PreToolUse', tool_name: ev && (ev.name || (ev.tool && ev.tool.name)), tool_input: (ev && (ev.args || ev.input)) ?? {} });
       if (AUTO) { try { if (ev && typeof ev.approve === 'function') ev.approve(); } catch (e) {} return { approve: true }; }
       return undefined;
     });
