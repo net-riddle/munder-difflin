@@ -121,6 +121,12 @@ export interface HarnessConfig {
   realtimeTtsVoice?: string;
   realtimeTtsSpeed?: number;
   realtimeTtsFormat?: TtsFormat;
+  /** Loudness multiplier (mirrors src/main/config.ts). */
+  realtimeTtsVolume?: number;
+  /** Forced text-processing language, '' = let the server infer it. */
+  realtimeTtsLang?: string;
+  /** Allow `[voice:name]` speaker switching in the input. */
+  realtimeTtsVoiceTags?: boolean;
   costCapUsd?: number;
   /** Hard total-token ceiling across active agents (the user-facing budget). */
   costCapTokens?: number;

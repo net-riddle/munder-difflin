@@ -1337,11 +1337,20 @@ const api = {
     | { ok: true; audio: string; mime: string; bytes: number }
     | { ok: false; error: string; code?: string }
   > => ipcRenderer.invoke('realtime:speak', req),
-  /** Settings → "Test voice": synthesizes a fixed line with the given values. */
-  realtimeSpeakTest: (
-    req?: { baseUrl?: string; model?: string; voice?: string; speed?: number; format?: string }
-  ): Promise<{ ok: boolean; error?: string; bytes?: number }> =>
-    ipcRenderer.invoke('realtime:speakTest', req ?? {}),
+  /** What models and voices the local TTS server actually serves.
+   *
+   *  Both lookups are optional in practice — a Kokoro instance answers both, an
+   *  openedai-speech instance answers neither — so the result carries
+   *  `modelsFromServer` / `voicesFromServer` and a `note` instead of failing.
+   *  The renderer turns that into a dropdown or into free text. */
+  realtimeTtsDiscover: (req?: { baseUrl?: string }): Promise<{
+    models: { id: string }[];
+    voices: { id: string; lang?: string; grade?: string }[];
+    modelsFromServer: boolean;
+    voicesFromServer: boolean;
+    languages: string[];
+    note?: string;
+  }> => ipcRenderer.invoke('realtime:ttsDiscover', req ?? {}),
   /** A task card just changed state (main's taskDoneAnnouncer). `kind` is
    *  'start' (entered `doing`), 'done' (reached `done`) or 'blocked' (now needs
    *  a human). This is the completion signal that does NOT depend on a voice

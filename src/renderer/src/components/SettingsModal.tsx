@@ -1,4 +1,4 @@
-import { useState, useEffect, type CSSProperties } from 'react';
+import { useState, useEffect, useRef, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AGENT_MODELS, type HarnessConfig } from '@/store/config';
 import {
@@ -6,12 +6,16 @@ import {
   TTS_FORMATS,
   TTS_MODELS,
   clampTtsSpeed,
+  clampTtsVolume,
+  normalizeTtsLang,
   normalizeTtsBaseUrl,
   normalizeTtsFormat,
   normalizeVoiceBackend,
   type RealtimeVoiceBackend,
   type TtsFormat
 } from '@shared/realtimeVoice';
+import { languageLabel } from '@shared/ttsDiscovery';
+import { playSample } from '@/realtime/localVoice';
 import { useStore } from '@/store/store';
 import {
   CLONE_NODE_BLURB,
@@ -573,25 +577,88 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
   const [ttsFormat, setTtsFormat] = useState<TtsFormat>(
     normalizeTtsFormat((config as HarnessConfig).realtimeTtsFormat)
   );
+  // The three knobs a server may accept beyond the OpenAI four. All optional and
+  // all off by default, because a server that does not implement them ignores
+  // them and a strict one may refuse the whole request.
+  const [ttsVolume, setTtsVolume] = useState(
+    String((config as HarnessConfig).realtimeTtsVolume ?? 1)
+  );
+  const [ttsLang, setTtsLang] = useState((config as HarnessConfig).realtimeTtsLang ?? '');
+  const [ttsVoiceTags, setTtsVoiceTags] = useState(
+    (config as HarnessConfig).realtimeTtsVoiceTags === true
+  );
+  /** What the server said it can do. `null` = not asked yet, which is why the
+   *  first paint shows a typed field rather than an empty dropdown. */
+  const [ttsFound, setTtsFound] = useState<Awaited<ReturnType<typeof window.cth.realtimeTtsDiscover>> | null>(null);
+  const [ttsFinding, setTtsFinding] = useState(false);
+  /** Language filter over the voice list. '' = all, so a voice in an unknown
+   *  prefix is never hidden by a filter the app invented. */
+  const [ttsLangFilter, setTtsLangFilter] = useState('');
   const [ttsBusy, setTtsBusy] = useState(false);
   const [ttsNote, setTtsNote] = useState('');
   /** Snapshot of the last successful test, so Settings can show what is
    *  actually listening rather than only that the last attempt passed. */
   const [ttsOk, setTtsOk] = useState<boolean | null>(null);
 
+  /**
+   * Ask the server what it serves.
+   *
+   * Never clears the current model or voice, whatever the answer: a server that
+   * is restarting, or a list that momentarily comes back short, must not send
+   * the user back to a default they had already moved away from. The lookups
+   * only ever ADD options.
+   */
+  const discoverTts = async (url?: string): Promise<void> => {
+    setTtsFinding(true);
+    try {
+      const r = await window.cth.realtimeTtsDiscover({ baseUrl: (url ?? ttsBaseUrl).trim() });
+      setTtsFound(r);
+      // Fill an EMPTY field from the server's first choice. Never overwrite one.
+      if (r.modelsFromServer && !ttsModel.trim()) setTtsModel(r.models[0]?.id ?? ttsModel);
+      if (r.voicesFromServer && !ttsVoice.trim()) setTtsVoice(r.voices[0]?.id ?? ttsVoice);
+    } catch (e) {
+      setTtsFound({ models: [], voices: [], modelsFromServer: false, voicesFromServer: false, languages: [], note: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setTtsFinding(false);
+    }
+  };
+
+  // Look once when the local block first becomes visible, so the dropdowns are
+  // populated without the user asking. Re-runs when the URL changes, because a
+  // different port is a different server.
+  const lastProbedUrl = useRef<string | null>(null);
+  useEffect(() => {
+    if (voiceBackend !== 'local-tts') return;
+    const url = normalizeTtsBaseUrl(ttsBaseUrl);
+    if (!url || url === lastProbedUrl.current) return;
+    lastProbedUrl.current = url;
+    void discoverTts(url);
+    // discoverTts is recreated each render; depending on it would re-probe on
+    // every keystroke, so the URL is the only real trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceBackend, ttsBaseUrl]);
+
+  /** The voices to show, after the language filter. */
+  const ttsVoiceOptions = (ttsFound?.voices ?? []).filter(
+    (v) => !ttsLangFilter || v.lang === ttsLangFilter
+  );
+
   /** Test the TTS server with the values on screen — not the saved ones. Saving
    *  a config and then discovering piper is not running wastes a round trip
-   *  through the whole voice loop to learn it. */
-  const testLocalVoice = async (): Promise<void> => {
+   *  through the whole voice loop to learn it. It PLAYS the audio, so the answer
+   *  to "is this the right voice" is heard rather than inferred. */  const testLocalVoice = async (): Promise<void> => {
     setTtsBusy(true);
     setTtsNote('');
     try {
-      const r = await window.cth.realtimeSpeakTest({
+      const r = await playSample(t('settings.voice.localTestLine'), {
         baseUrl: ttsBaseUrl.trim(),
-        model: ttsModel,
+        model: ttsModel.trim(),
         voice: ttsVoice.trim(),
         speed: Number(ttsSpeed),
-        format: ttsFormat
+        format: ttsFormat,
+        volume: clampTtsVolume(ttsVolume),
+        lang: ttsLang.trim(),
+        voiceTags: ttsVoiceTags
       });
       setTtsOk(r.ok);
       setTtsNote(r.ok
@@ -610,10 +677,13 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
   const voiceEnginePatch = (): Partial<HarnessConfig> => ({
     realtimeVoiceBackend: voiceBackend,
     realtimeTtsBaseUrl: normalizeTtsBaseUrl(ttsBaseUrl) || ttsBaseUrl.trim(),
-    realtimeTtsModel: ttsModel,
+    realtimeTtsModel: ttsModel.trim() || DEFAULT_LOCAL_TTS.model,
     realtimeTtsVoice: ttsVoice.trim() || DEFAULT_LOCAL_TTS.voice,
     realtimeTtsSpeed: clampTtsSpeed(ttsSpeed),
-    realtimeTtsFormat: ttsFormat
+    realtimeTtsFormat: ttsFormat,
+    realtimeTtsVolume: clampTtsVolume(ttsVolume),
+    realtimeTtsLang: ttsLang.trim(),
+    realtimeTtsVoiceTags: ttsVoiceTags
   }) as Partial<HarnessConfig>;
 
   // Re-seed every editable field from the on-disk config when the modal opens.
@@ -645,6 +715,9 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
       setTtsVoice((c as HarnessConfig).realtimeTtsVoice ?? DEFAULT_LOCAL_TTS.voice);
       setTtsSpeed(String((c as HarnessConfig).realtimeTtsSpeed ?? DEFAULT_LOCAL_TTS.speed));
       setTtsFormat(normalizeTtsFormat((c as HarnessConfig).realtimeTtsFormat));
+      setTtsVolume(String((c as HarnessConfig).realtimeTtsVolume ?? 1));
+      setTtsLang((c as HarnessConfig).realtimeTtsLang ?? '');
+      setTtsVoiceTags((c as HarnessConfig).realtimeTtsVoiceTags === true);
     }).catch(() => { /* keep prop-seeded values */ });
     window.cth.kgStatus().then((s) => { if (alive) setKgDocCount(s.docCount); })
       .catch(() => { /* status unavailable */ });
@@ -2122,15 +2195,31 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
                               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                                 <label style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 150 }}>
                                   <span style={slackLabelStyle}>{t('settings.voice.localModel')}</span>
-                                  <select
-                                    value={ttsModel}
-                                    onChange={(e) => setTtsModel(e.target.value)}
-                                    style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
-                                  >
-                                    {TTS_MODELS.map((m) => (
-                                      <option key={m} value={m}>{m}</option>
-                                    ))}
-                                  </select>
+                                  {ttsFound?.modelsFromServer ? (
+                                    /* The server named its models, so offer exactly those.
+                                       Free text stays reachable through the datalist on the
+                                       "custom" row below for a model added after this probe. */
+                                    <select
+                                      value={ttsModel}
+                                      onChange={(e) => setTtsModel(e.target.value)}
+                                      style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                    >
+                                      {ttsFound.models.map((m) => (
+                                        <option key={m.id} value={m.id}>{m.id}</option>
+                                      ))}
+                                    </select>
+                                  ) : (
+                                    /* No list from the server (openedai-speech serves no
+                                       /v1/models). Typing the model name is the only way, and
+                                       the datalist keeps the usual names one keystroke away. */
+                                    <input
+                                      list="cth-tts-models"
+                                      value={ttsModel}
+                                      onChange={(e) => setTtsModel(e.target.value)}
+                                      placeholder={DEFAULT_LOCAL_TTS.model}
+                                      style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                    />
+                                  )}
                                 </label>
                                 <label style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 130 }}>
                                   <span style={slackLabelStyle}>{t('settings.voice.localFormat')}</span>
@@ -2162,15 +2251,104 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
 
                               <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                                 <span style={slackLabelStyle}>{t('settings.voice.localVoiceName')}</span>
-                                <input
-                                  value={ttsVoice}
-                                  onChange={(e) => setTtsVoice(e.target.value)}
-                                  placeholder={DEFAULT_LOCAL_TTS.voice}
-                                  style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
-                                />
+                                {ttsFound?.voicesFromServer ? (
+                                  <>
+                                    {/* A 72-entry flat list is unusable, so the language is
+                                        the first axis of choice and the grade rides along as
+                                        a hint: Kokoro exposes many near-identical ids
+                                        (af_heart / af_bella) whose only visible difference
+                                        is quality. */}
+                                    {ttsFound.languages.length > 1 && (
+                                      <select
+                                        value={ttsLangFilter}
+                                        onChange={(e) => setTtsLangFilter(e.target.value)}
+                                        style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                      >
+                                        <option value="">{t('settings.voice.localAllLangs')}</option>
+                                        {ttsFound.languages.map((l) => (
+                                          /* Code AND label: `af` and `am` are both
+                                             "English (US)", so the label alone
+                                             renders two identical rows in the filter
+                                             and the user cannot tell them apart. */
+                                          <option key={l} value={l}>{l} · {languageLabel(l)}</option>
+                                        ))}
+                                      </select>
+                                    )}
+                                    <select
+                                      value={ttsVoice}
+                                      onChange={(e) => setTtsVoice(e.target.value)}
+                                      style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                    >
+                                      {ttsVoiceOptions.length === 0 && (
+                                        <option value={ttsVoice}>{ttsVoice || DEFAULT_LOCAL_TTS.voice}</option>
+                                      )}
+                                      {ttsVoiceOptions.map((v) => (
+                                        <option key={v.id} value={v.id}>
+                                          {v.id}
+                                          {v.lang ? ` · ${languageLabel(v.lang)}` : ''}
+                                          {v.grade ? ` — ${t('settings.voice.localGrade', { grade: v.grade })}` : ''}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </>
+                                ) : (
+                                  <input
+                                    value={ttsVoice}
+                                    onChange={(e) => setTtsVoice(e.target.value)}
+                                    placeholder={DEFAULT_LOCAL_TTS.voice}
+                                    style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                  />
+                                )}
                               </label>
 
-                              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                              {/* Kokoro-only knobs. Kept visible (not behind a flag) because
+                                  a server that ignores them behaves exactly as before, and
+                                  one that honours them is unusable without them. */}
+                              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 150 }}>
+                                  <span style={slackLabelStyle}>{t('settings.voice.localVolume')}</span>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    max={10}
+                                    step={0.1}
+                                    value={ttsVolume}
+                                    onChange={(e) => setTtsVolume(e.target.value)}
+                                    style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                  />
+                                </label>
+                                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 150 }}>
+                                  <span style={slackLabelStyle}>{t('settings.voice.localLang')}</span>
+                                  <input
+                                    list="cth-tts-langs"
+                                    value={ttsLang}
+                                    onChange={(e) => setTtsLang(e.target.value)}
+                                    placeholder={t('settings.voice.localLangPlaceholder')}
+                                    style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                  />
+                                </label>
+                                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 190 }}>
+                                  <span style={slackLabelStyle}>{t('settings.voice.localVoiceTags')}</span>
+                                  <select
+                                    value={ttsVoiceTags ? '1' : '0'}
+                                    onChange={(e) => setTtsVoiceTags(e.target.value === '1')}
+                                    style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                                  >
+                                    <option value="0">{t('settings.voice.localVoiceTagsOff')}</option>
+                                    <option value="1">{t('settings.voice.localVoiceTagsOn')}</option>
+                                  </select>
+                                </label>
+                              </div>
+
+                              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                                <PixelButton
+                                  variant="secondary"
+                                  size="sm"
+                                  onClick={() => void discoverTts()}
+                                  disabled={ttsFinding}
+                                >
+                                  {ttsFinding ? t('settings.voice.localScanning') : t('settings.voice.localRescan')}
+                                </PixelButton>
                                 <PixelButton
                                   variant="secondary"
                                   size="sm"
@@ -2179,15 +2357,34 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
                                 >
                                   {ttsBusy ? t('settings.voice.localTesting') : t('settings.voice.localTest')}
                                 </PixelButton>
+                                {ttsFound?.note && (
+                                  <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
+                                    {ttsFound.note}
+                                  </span>
+                                )}
                                 {ttsNote && (
                                   <span style={{
-                                    fontSize: 12, lineHeight: '16px',
-                                    color: ttsOk ? 'var(--cth-ink-900)' : 'var(--cth-coral)'
-                                  }}>
-                                    {ttsNote}
+                                     fontSize: 12, lineHeight: '16px',
+                                     color: ttsOk ? 'var(--cth-ink-900)' : 'var(--cth-coral)'
+                                   }}>
+                                     {ttsNote}
                                   </span>
                                 )}
                               </div>
+
+                              {/* Datalists for the free-text paths. Not rendered when the
+                                  server answered — a suggestion list of models that
+                                  server does not have would be a lie. */}
+                              {!ttsFound?.modelsFromServer && (
+                                <datalist id="cth-tts-models">
+                                  {TTS_MODELS.map((m) => <option key={m} value={m} />)}
+                                </datalist>
+                              )}
+                              <datalist id="cth-tts-langs">
+                                {(ttsFound?.languages ?? []).map((l) => (
+                                  <option key={l} value={normalizeTtsLang(l)} />
+                                ))}
+                              </datalist>
 
                               <span style={{ fontSize: 12, lineHeight: '17px', color: 'var(--cth-ink-500)' }}>
                                 {t('settings.voice.localHint')}

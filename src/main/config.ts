@@ -381,15 +381,26 @@ export interface HarnessConfig {
    *  Kokoro-FastAPI, …). Normalized on read: bare host, missing /v1 and
    *  trailing slashes all resolve to `<scheme>://<host>/v1`. */
   realtimeTtsBaseUrl?: string;
-  /** TTS model id: 'tts-1' (piper, CPU) or 'tts-1-hd' (XTTS, voice cloning). */
+  /** TTS model id. DISCOVERED, not enumerated: the app asks the server what it
+   *  serves, because the list differs per server and grows over time. */
   realtimeTtsModel?: string;
-  /** TTS voice: alloy | echo | fable | onyx | nova | shimmer, or a custom voice. */
+  /** TTS voice: an OpenAI alias, a Kokoro voice id, or any other server voice. */
   realtimeTtsVoice?: string;
   /** TTS speaking rate, 0.25–4.0 (clamped on read). */
   realtimeTtsSpeed?: number;
   /** Audio container returned by the TTS server (mp3 by default — the only
-   *  format every browser sink plays without extra decoding). */
+   * format every browser sink plays without extra decoding). */
   realtimeTtsFormat?: TtsFormat;
+  /** Loudness multiplier, 0–10 (clamped on read). Honoured by servers that
+   *  accept `volume_multiplier`; inert on the ones that do not. */
+  realtimeTtsVolume?: number;
+  /** Force the text-processing language instead of inferring it from the voice
+   *  name. The useful one for a multi-language voice, where inference is a
+   *  guess. Empty string = let the server decide. */
+  realtimeTtsLang?: string;
+  /** Allow `[voice:name]` in the input to switch speaker mid-sentence. Off by
+   *  default: a bracketed word in ordinary prose would otherwise be spoken. */
+  realtimeTtsVoiceTags?: boolean;
 
   // ─── Generic inbound webhook + status API (LEGACY, single-endpoint) ─────────
   // Superseded by `webhookTriggers`, which allows many endpoints over one server
@@ -492,6 +503,9 @@ const DEFAULTS: HarnessConfig = {
   realtimeTtsVoice: DEFAULT_LOCAL_TTS.voice,
   realtimeTtsSpeed: DEFAULT_LOCAL_TTS.speed,
   realtimeTtsFormat: DEFAULT_LOCAL_TTS.format,
+  realtimeTtsVolume: 1,
+  realtimeTtsLang: '',
+  realtimeTtsVoiceTags: false,
   webhookEnabled: false,
   webhookSecret: undefined,
   webhookPort: undefined,

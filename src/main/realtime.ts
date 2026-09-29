@@ -36,6 +36,12 @@ import {
   type LocalTtsSettings,
   type RealtimeVoiceBackend
 } from '../shared/realtimeVoice';
+import {
+  languagesOf,
+  parseModels,
+  parseVoices,
+  type VoiceDiscovery
+} from '../shared/ttsDiscovery';
 
 /** Mirrors `providerKeyRef('openai')` in src/main/index.ts (BACKEND_KEY_ENV maps
  *  openai→OPENAI_API_KEY). Inlined as a local const so this module needs no new
@@ -68,6 +74,11 @@ const MAX_SPEAK_CHARS = 2_000;
  *  message: a 15MB clip is already ~4s of XTTS audio, so anything larger is a
  *  misconfigured endpoint (an HTML error page, a directory listing). */
 const MAX_SPEAK_BYTES = 15 * 1024 * 1024;
+
+/** How long a `/models` or `/audio/voices` lookup may take. Short on purpose:
+ *  it runs behind a Settings dropdown, and a slow answer there is worse than a
+ *  fast "this server does not list anything" with free text as the fallback. */
+const DISCOVERY_TIMEOUT_MS = 4_000;
 
 /**
  * The synthesis budget, loaded from disk rather than defined here.
@@ -135,8 +146,72 @@ export function getLocalTtsSettings(): LocalTtsSettings {
     model: cfg.realtimeTtsModel,
     voice: cfg.realtimeTtsVoice,
     speed: cfg.realtimeTtsSpeed,
-    format: cfg.realtimeTtsFormat
+    format: cfg.realtimeTtsFormat,
+    volume: cfg.realtimeTtsVolume,
+    lang: cfg.realtimeTtsLang,
+    voiceTags: cfg.realtimeTtsVoiceTags
   });
+}
+
+/**
+ * Ask the TTS server what it can do.
+ *
+ * Two independent lookups, because either can be missing on its own: a
+ * Kokoro-FastAPI instance serves both, an openedai-speech instance serves
+ * neither. Neither failure is an error — the caller gets whatever was found plus
+ * a flag saying where it came from, and the Settings UI falls back to free text.
+ * A single hard failure would make a perfectly good server look broken.
+ *
+ * `voices` is a 404 on most servers by design: the endpoint is a voice-clone
+ * extension, not part of the OpenAI API, so only servers that ship one answer.
+ */
+export async function discoverTts(
+  baseOverride?: string
+): Promise<VoiceDiscovery> {
+  const base = normalizeTtsBaseUrl(baseOverride ?? getLocalTtsSettings().baseUrl);
+  if (!base) {
+    return {
+      models: [],
+      voices: [],
+      modelsFromServer: false,
+      voicesFromServer: false,
+      languages: [],
+      note: 'The TTS URL is not a valid http(s) address.'
+    };
+  }
+
+  const get = async (path: string): Promise<unknown> => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), DISCOVERY_TIMEOUT_MS);
+    try {
+      const r = await fetch(`${base}${path}`, { signal: ac.signal });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // Both in parallel: a discovery that takes the sum of two timeouts feels
+  // broken to someone waiting on a Settings field.
+  const [modelsRaw, voicesRaw] = await Promise.all([get('/models'), get('/audio/voices')]);
+
+  const modelIds = parseModels(modelsRaw);
+  const voices = parseVoices(voicesRaw);
+  const notes: string[] = [];
+  if (!modelIds.length) notes.push('This server does not list its models.');
+  if (!voices.length) notes.push('This server does not list its voices.');
+
+  return {
+    models: modelIds.map((id) => ({ id })),
+    voices,
+    modelsFromServer: modelIds.length > 0,
+    voicesFromServer: voices.length > 0,
+    languages: languagesOf(voices),
+    note: notes.length ? notes.join(' ') : undefined
+  };
 }
 
 /** What the renderer needs to know before it opens a session: the backend in
@@ -185,7 +260,17 @@ export async function speak(
         input,
         voice: settings.voice,
         response_format: settings.format,
-        speed: settings.speed
+        speed: settings.speed,
+        // The three non-OpenAI knobs, sent ONLY when they are set. A server that
+        // does not implement them ignores unknown fields, but a strict one may
+        // 400 on them — so `volume` at its neutral 1 is omitted rather than
+        // sent, which is indistinguishable from "not configured" and cannot be
+        // misread as a request to change anything.
+        ...(settings.volume !== undefined && settings.volume !== 1
+          ? { volume_multiplier: settings.volume }
+          : {}),
+        ...(settings.lang ? { lang_code: settings.lang } : {}),
+        ...(settings.voiceTags ? { allow_voice_tags: true } : {})
       }),
       signal: ac.signal
     });
@@ -219,16 +304,6 @@ export async function speak(
   } finally {
     clearTimeout(timer);
   }
-}
-
-/** Settings → "Test voice": synthesize a fixed line so the user hears the
- *  result instead of trusting a status line. `overrides` lets the button test
- *  the values currently TYPED, before they are saved. */
-export async function testSpeak(overrides: Partial<LocalTtsSettings> = {}): Promise<
-  { ok: boolean; error?: string; bytes?: number }
-> {
-  const res = await speak('Voice check. Munder Difflin is listening.', overrides);
-  return res.ok ? { ok: true, bytes: res.bytes } : { ok: false, error: res.error };
 }
 
 export type MintResult =
@@ -332,12 +407,17 @@ export function registerRealtimeIpc(): void {
     if (p.speed != null) overrides.speed = p.speed as number;
     if (typeof p.baseUrl === 'string' && p.baseUrl.trim()) overrides.baseUrl = p.baseUrl.trim();
     if (typeof p.format === 'string') overrides.format = resolveLocalTtsSettings({ format: p.format }).format;
+    if (p.volume != null) overrides.volume = p.volume as number;
+    if (typeof p.lang === 'string') overrides.lang = p.lang;
+    if (typeof p.voiceTags === 'boolean') overrides.voiceTags = p.voiceTags;
     return speak(typeof p.text === 'string' ? p.text : '', overrides);
   });
-  // Settings → "Test voice", with the values currently typed but not yet saved.
-  ipcMain.handle('realtime:speakTest', async (_evt, payload: unknown) => {
-    const p = (payload ?? {}) as Partial<LocalTtsSettings>;
-    return testSpeak(p ?? {});
+  // Settings → what models and voices does this server actually serve? The
+  // answer drives the two dropdowns, and a server that answers neither is a
+  // normal case, not an error — see discoverTts.
+  ipcMain.handle('realtime:ttsDiscover', async (_evt, payload: unknown) => {
+    const p = (payload ?? {}) as { baseUrl?: unknown };
+    return discoverTts(typeof p.baseUrl === 'string' ? p.baseUrl : undefined);
   });
   // Presence, so the log can distinguish "no key" from "key refused". Never the
   // key, never a fragment of it.

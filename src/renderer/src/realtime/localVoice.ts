@@ -325,6 +325,44 @@ export function speakLine(text: string): Promise<SpeakOutcome> {
   });
 }
 
+/** Settings → "Test voice": synthesize with the values ON SCREEN and PLAY it.
+ *
+ *  WHY THIS EXISTS RATHER THAN A BYTE COUNT. The button used to report "48210
+ *  bytes" and stop there. That number proves a server answered; it proves
+ *  nothing about whether the chosen voice is intelligible, correctly gendered,
+ *  or in the right language — which is the only reason to press the button. So
+ *  the clip is played through the same sink the announcer uses, and the result
+ *  says whether it was actually HEARD.
+ *
+ *  `overrides` is the point: the values typed but not yet saved, so a user can
+ *  audition a voice before committing it to the config. */
+export async function playSample(
+  text: string,
+  overrides: {
+    baseUrl?: string;
+    model?: string;
+    voice?: string;
+    speed?: number;
+    format?: string;
+    volume?: number;
+    lang?: string;
+    voiceTags?: boolean;
+  } = {}
+): Promise<{ ok: boolean; error?: string; bytes?: number }> {
+  const res = await window.cth.realtimeSpeak({ text, ...overrides }).catch((e: unknown) => ({
+    ok: false as const,
+    error: e instanceof Error ? e.message : String(e)
+  }));
+  if (!res.ok) return { ok: false, error: res.error };
+  const el = ensureSink();
+  if (!el) return { ok: false, error: 'no audio output available' };
+  const outcome = await playClip(el, res.audio, res.mime, generation);
+  // 'failed' after a 200 is a decode problem, not a server problem, and the
+  // message has to say which or the user goes looking in the wrong place.
+  if (outcome === 'failed') return { ok: false, error: 'audio could not be decoded' };
+  return { ok: true, bytes: res.bytes };
+}
+
 /** Cut playback short and drop anything queued. Used when announcements are
  *  switched off. Releasing the playing clip is the load-bearing part: see
  *  cancelActiveClip for what happens if it is left to wait for an event that a

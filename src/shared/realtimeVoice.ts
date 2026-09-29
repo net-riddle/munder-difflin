@@ -35,8 +35,15 @@ export function normalizeVoiceBackend(v: unknown): RealtimeVoiceBackend {
 export const TTS_FORMATS = ['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm'] as const;
 export type TtsFormat = (typeof TTS_FORMATS)[number];
 
-/** The model ids openedai-speech maps to its backends: piper (CPU) and XTTS (GPU). */
-export const TTS_MODELS = ['tts-1', 'tts-1-hd'] as const;
+/** The model ids openedai-speech maps to its backends: piper (CPU) and XTTS (GPU).
+ *
+ *  @deprecated A FIXED LIST IS THE WRONG SHAPE. It was true of openedai-speech
+ *  and false of everything else: Kokoro-FastAPI serves four models
+ *  (`tts-1`, `tts-1-hd`, `kokoro`, `gpt-4o-mini-tts`) and its default voice
+ *  `af_heart` is in no list anyone can write down ahead of time. Kept only as the
+ *  fallback hint for a server that will not serve `/models`; the real list is
+ *  discovered at runtime — see `src/shared/ttsDiscovery.ts`. */
+export const TTS_MODELS = ['tts-1', 'tts-1-hd', 'kokoro', 'gpt-4o-mini-tts'] as const;
 
 /** Default endpoint of a stock openedai-speech container. */
 export const DEFAULT_TTS_BASE_URL = 'http://localhost:8000/v1';
@@ -44,13 +51,32 @@ export const DEFAULT_TTS_BASE_URL = 'http://localhost:8000/v1';
 export interface LocalTtsSettings {
   /** OpenAI-compatible root, ending in /v1. */
   baseUrl: string;
-  /** 'tts-1' (piper, CPU) or 'tts-1-hd' (XTTS, voice cloning). */
+  /** Any model the server reports. Free text: a server that does not serve
+   *  `/models` must still be usable. Discovered at runtime, never enumerated. */
   model: string;
-  /** 'alloy' | 'echo' | 'fable' | 'onyx' | 'nova' | 'shimmer', or a custom voice. */
+  /** Any voice the server reports — an OpenAI alias or a Kokoro voice id. */
   voice: string;
   /** 0.25 – 4.0, as the OpenAI speech API accepts. */
   speed: number;
   format: TtsFormat;
+  /**
+   * The three knobs an OpenAI-compatible server may accept beyond the standard
+   * four, all confirmed present on Kokoro-FastAPI and all INERT on a server that
+   * does not implement them — which is why they are optional and off by default
+   * rather than required.
+   *
+   *  - `volume`: a multiplier. Useful when a voice is much louder or quieter
+   *    than the rest; without it the only fix is the OS mixer.
+   *  - `lang`: forces the text-processing language instead of inferring it from
+   *    the first letter of the voice name. This is the one that matters for a
+   *    multi-language voice, where inference is a guess.
+   *  - `voiceTags`: enables `[voice:name]` switching mid-sentence. Off by
+   *    default because a bracketed word in ordinary prose would otherwise be
+   *    spoken as "open bracket".
+   */
+  volume?: number;
+  lang?: string;
+  voiceTags?: boolean;
 }
 
 export const DEFAULT_LOCAL_TTS: LocalTtsSettings = {
@@ -58,7 +84,17 @@ export const DEFAULT_LOCAL_TTS: LocalTtsSettings = {
   model: 'tts-1',
   voice: 'alloy',
   speed: 1,
-  format: 'mp3'
+  format: 'mp3',
+  // The three Kokoro-only knobs. Present HERE and not merely optional, so that
+  // a resolved settings object and the defaults are the same shape: a consumer
+  // that deep-compares them, or that spreads the defaults into a request, would
+  // otherwise see two different objects and fail on the difference.
+  volume: 1,
+  // '' = "no explicit language", which is not the same as a language: it tells
+  // speak() to leave lang_code out of the request entirely, so a server that
+  // rejects the field is never asked.
+  lang: '',
+  voiceTags: false
 };
 
 /** MIME per format, for the <audio> sink. `pcm` is raw and unplayable without
@@ -131,6 +167,22 @@ export function clampTtsSpeed(raw: unknown): number {
   return Math.min(4, Math.max(0.25, Math.round(n * 100) / 100));
 }
 
+/** Clamp a volume multiplier into the 0–10 window Kokoro documents. A stray
+ *  value is clamped rather than rejected: an unusable loudness is not worth a
+ *  refusal, and the user can always hear the problem and lower it. */
+export function clampTtsVolume(raw: unknown): number {
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!isFinite(n) || n < 0) return 1;
+  return Math.min(10, Math.round(n * 100) / 100);
+}
+
+/** A language code, lowercased, or '' when absent. Free-form on purpose: Kokoro
+ *  accepts a code the app has never seen, and rejecting an unknown one would
+ *  make a working voice unreachable. */
+export function normalizeTtsLang(raw: unknown): string {
+  return typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+}
+
 /** Fill a partial (config-on-disk) object with defaults for whatever is absent. */
 export function resolveLocalTtsSettings(raw: unknown): LocalTtsSettings {
   const s = (raw ?? {}) as Partial<LocalTtsSettings>;
@@ -139,7 +191,13 @@ export function resolveLocalTtsSettings(raw: unknown): LocalTtsSettings {
     model: normalizeTtsModel(s.model),
     voice: normalizeTtsVoice(s.voice),
     speed: clampTtsSpeed(s.speed),
-    format: normalizeTtsFormat(s.format)
+    format: normalizeTtsFormat(s.format),
+    volume: clampTtsVolume(s.volume),
+    lang: normalizeTtsLang(s.lang),
+    // Only ever `true` when explicitly set. The default matters: voice tags make
+    // `[voice:x]` in ordinary prose switch speaker, so a bracketed word would be
+    // spoken as "open bracket" — the feature has to be asked for by name.
+    voiceTags: s.voiceTags === true
   };
 }
 

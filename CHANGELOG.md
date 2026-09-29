@@ -8,6 +8,20 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **The app asks your TTS server what it can do, instead of guessing.** The model and voice
+  pickers in Settings → Voice used to be a hardcoded list of two OpenAI model names, which any
+  other server made wrong the moment you pointed it somewhere else. On opening the local voice
+  block the app now queries the server directly and builds the pickers from the answer: Kokoro
+  reports four models and 72 voices, all of them selectable, with each voice labelled by language
+  and carrying the server's own quality grade. A language filter is there because 72 entries in a
+  flat list is unusable. Servers that answer neither endpoint — openedai-speech, for one — are a
+  normal case, not an error: the fields fall back to free text with the common names suggested,
+  so nothing that worked before stops working. The current model and voice are never replaced by
+  a probe result; a server mid-restart cannot move you off a choice that was working.
+- **Kokoro's extra parameters are exposed.** Volume multiplier, language code and voice tags
+  (`volume_multiplier`, `lang_code`, `allow_voice_tags`) are now editable. Each is sent only when
+  it differs from the default, so a server that does not implement them is never asked about
+  fields it will reject.
 - **Michael can speak with a voice you host yourself.** Settings → Voice has a Voice engine picker:
   the shipped OpenAI cloud audio, or a local text-to-speech server. The choice is only about the
   VOICE — he still listens and thinks on the Realtime API, with the same persona, tools and
@@ -26,6 +40,11 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Test voice now actually plays the audio.** The button reported a byte count and stopped there,
+  which proves a server answered but says nothing about whether the voice you picked is
+  intelligible or in the right language — the only reason to press it. It now speaks the line
+  through the same output Michael uses, and distinguishes a clip that arrived but could not be
+  decoded from a server that could not be reached, because those send you to different places.
 - **The app no longer dies on launch under `npm run dev`.** Starting the dev server produced
   `Cannot find module './tts-budget.cjs'` and a blank window. The raw `.cjs` helpers the main process
   loads at runtime were listed in two places — the build script and the vite hook that runs in dev —
