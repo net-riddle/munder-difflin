@@ -787,8 +787,13 @@ export function modelForRole(
     const preset = providerPreset(config?.godProvider ?? 'claude');
     return config?.godModel ?? preset.recommendedOrchestratorModel ?? MODEL_GOD;
   }
-  const hay = `${meta.role ?? ''} ${(meta.capabilities ?? []).join(' ')}`.toLowerCase();
-  if (/\b(triage|rout|verif|lint|format|summar|classif|label)/.test(hay)) return MODEL_HELPER;
+  // Reads `capabilities` and NOT `role`, on purpose. This used to regex both,
+  // which made a free-text field a decision input: one person's "Sviluppatore"
+  // could not be matched, and another person's "triage" could. A field for
+  // people (role) and a field for machines (capabilities) cannot share a
+  // decision. See src/main/capabilities.ts.
+  const hay = (meta.capabilities ?? []).join(' ').toLowerCase();
+  if (/\b(triage|rout|verif|lint|format|summar|classif|label)\b/.test(hay)) return MODEL_HELPER;
   return MODEL_WORKER;
 }
 

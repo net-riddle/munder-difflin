@@ -41,6 +41,7 @@ import {
 import { MCP_CATALOG } from '../shared/mcpCatalog';
 import { selectBroadcastTargets } from '../shared/broadcast';
 import { preferredAgentRole } from '../shared/agentRole';
+import { deriveCapabilities } from './capabilities';
 import { mergeTaskLedger } from '../shared/taskLedger';
 import { expandTilde } from './fs';
 import { resolveGodName } from '../shared/godIdentity';
@@ -691,7 +692,12 @@ export class HiveManager {
     reg.agents[meta.id] = {
       ...prev,
       ...meta,
-      capabilities: meta.capabilities ?? prev?.capabilities ?? [],
+      // Derived by the SYSTEM from isGod + cwd, then filtered through the closed
+      // vocabulary — never taken from prose. This is the whole point: a
+      // machine-read field that a person can also type inherits every typo they
+      // ever made, which is exactly how `role` became unqueryable ("Developer"
+      // and "developer" both live on this floor). See src/main/capabilities.ts.
+      capabilities: deriveCapabilities({ isGod: meta.isGod, cwd: meta.cwd }),
       role,
       status: 'idle',
       cwdValid: cwd.valid,
