@@ -39,7 +39,14 @@ require.cache[posthogPath] = {
 
 const { Analytics, MESSAGE_SURFACES, isRendererMessageSurface } = loadTs('src/main/analytics.ts');
 
-const read = (rel) => fs.readFileSync(path.resolve(__dirname, '..', rel), 'utf8');
+// LF-normalised on the way in. Every source file in this repo is CRLF, and the
+// two "counted HERE, not inside the shared action" assertions below use a bare
+// `\n` to mean *the very next line* — in a CRLF file that never matches, so both
+// went red on a codebase that had them in exactly the right place. Those two
+// assertions are the ones that stop work orders, Slack inbound, nudges and the
+// voice layer from being counted as a person typing, so they are worth more
+// than their own passing would suggest.
+const read = (rel) => fs.readFileSync(path.resolve(__dirname, '..', rel), 'utf8').replace(/\r\n/g, '\n');
 const main = read('src/main/index.ts');
 const preload = read('src/preload/index.ts');
 const telemetryDoc = read('TELEMETRY.md');

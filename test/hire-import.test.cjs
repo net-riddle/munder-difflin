@@ -99,12 +99,20 @@ test('batch token caps persist atomically before review advances', () => {
 });
 
 test('Command Center sets and clears one cap through the atomic IPC', () => {
-  const panel = readFileSync('src/renderer/src/components/CommandCenterPanel.tsx', 'utf8');
+  // LF-normalised on the way in: this file is CRLF, so an LF anchor such as
+  // '\n\n  // The token meter' is not present in it. `indexOf` returned -1, `end`
+  // was never > start, and this test failed on its own guard having examined
+  // NOTHING about the handler — the first of the two assertions never ran.
+  const panel = readFileSync('src/renderer/src/components/CommandCenterPanel.tsx', 'utf8')
+    .replace(/\r\n/g, '\n');
   const start = panel.indexOf('const setAgentCap =');
   const end = panel.indexOf('\n\n  // The token meter', start);
   const capFlow = panel.slice(start, end);
 
-  assert.ok(start >= 0 && end > start, 'Command Center cap handler is present');
-  assert.match(capFlow, /window\.cth\.setAgentTokenCap\(id, tokens\)/);
-  assert.doesNotMatch(capFlow, /updateConfig\(\{\s*agentTokenCaps/);
+  assert.ok(start >= 0, 'the cap handler declaration is not in the panel at all');
+  assert.ok(end > start, 'the token-meter comment that bounds the handler is missing');
+  assert.match(capFlow, /window\.cth\.setAgentTokenCap\(id, tokens\)/,
+    'the cap must go through the atomic IPC');
+  assert.doesNotMatch(capFlow, /updateConfig\(\{\s*agentTokenCaps/,
+    'renderer must never persist a cap from a stale config snapshot');
 });

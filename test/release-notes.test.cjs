@@ -337,8 +337,13 @@ test('the notes file we actually ship fits the toast', () => {
 test('electron-builder points the release notes at a file that exists', () => {
   // Without this field electron-updater silently falls back to the atom feed,
   // which is the whole bug. A typo here fails open and looks like nothing.
+  // `\r?\n` on the line break, not a bare `\n`: electron-builder.yml is CRLF, so
+  // the LF-only pattern matched nothing at all. That made this test a false alarm
+  // — it reported a missing field on a config that has it, pointing at a file
+  // that exists. The danger named in the comment above is a typo failing open;
+  // a check that cannot match fails closed on every run, which hides the typo.
   const cfg = fs.readFileSync(path.join(__dirname, '..', 'electron-builder.yml'), 'utf8');
-  const match = cfg.match(/^releaseInfo:\n\s+releaseNotesFile:\s*(\S+)\s*$/m);
+  const match = cfg.match(/^releaseInfo:\r?\n\s+releaseNotesFile:\s*(\S+)\s*$/m);
 
   assert.ok(match, 'releaseInfo.releaseNotesFile is missing from electron-builder.yml');
   assert.ok(

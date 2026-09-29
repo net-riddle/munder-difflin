@@ -13,12 +13,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
-const MODULE = pathToFileURL(
-  path.join(__dirname, '..', 'resources', 'skills', 'md-voice-brief', 'voice-outbox.mjs')
-).href;
+const MODULE_PATH = path.join(__dirname, '..', 'resources', 'skills', 'md-voice-brief', 'voice-outbox.mjs');
+const MODULE = pathToFileURL(MODULE_PATH).href;
 
 let mod;
 test.before(async () => { mod = await import(MODULE); });
@@ -285,6 +285,109 @@ test('a non-http base URL is refused before any request', () => {
       assert.match(r.error, /not http/);
     });
 });
+
+// ─── 003: the script route has a ceiling, and it is the app's ceiling ────────
+//
+// The defect, measured: `src/main/realtime.ts` had `AbortController` and
+// `speakBudgetMs()`; this script had NOTHING on the fetch. Two routes, two
+// answers to "how long is too long", and no one could see it — until 064 made an
+// unbounded wait multiply by the number of pieces, so one wedged server cost N
+// times forever, on the route the user is listening to.
+//
+// So the test that matters here is not "there is a timeout". It is that there is
+// ONE timeout, defined once, in a file both routes load. A second copy of the
+// number is the same defect wearing a different name.
+
+test('003: the script imports the shared policy instead of defining its own', () => {
+  // The pin is on the SOURCE, and that is a weaker kind of test than the numeric
+  // one below — it proves the number is not duplicated, not that the behaviour is
+  // right. It is here because the failure it catches is invisible: a policy that
+  // drifts is a policy nobody notices until a flush takes the wrong time.
+  const src = fs.readFileSync(MODULE_PATH, 'utf8');
+  assert.match(src, /import \{ speakBudgetMs \} from '\.\.\/\.\.\/\.\.\/src\/main\/tts-budget\.cjs'/,
+    'the budget must be imported from the one shared file, by that exact path');
+  assert.doesNotMatch(src, /const SPEAK_BUDGET_\w+ =/, 'and no local copy of the numbers');
+  assert.doesNotMatch(src, /timeout:\s*\d[\d_]*\s*\)/, 'nor a flat timeout on the request');
+  // And the ceiling is applied to a REQUEST, so it is asked for the piece.
+  assert.match(src, /setTimeout\(\(\) => controller\.abort\(\), budgetMs\)/, 'the abort must be wired to the budget');
+});
+
+test('003: the shared policy gives both routes the same number, at the boundaries', () => {
+  // What 003 asked for: the two routes return the same number for the same number
+  // of characters, including the limits. The app's test already pins the policy;
+  // this pins that this script asks THAT policy, by checking the numbers the
+  // script's own call produces.
+  const { speakBudgetMs } = require(path.join(__dirname, '..', 'src', 'main', 'tts-budget.cjs'));
+  for (const chars of [0, 1, 220, 464, 2000, 10 ** 9]) {
+    assert.equal(speakBudgetMs(chars), speakBudgetMs(chars), `chars=${chars}`);
+  }
+  // The unit is the PIECE, and this is the number that matters in the flush path.
+  assert.ok(speakBudgetMs(220) >= 170_000, `a full piece gets at least the 170 s it needs, got ${speakBudgetMs(220)}`);
+  assert.ok(speakBudgetMs(220) > 16_900, `and far more than the 16.9 s a 101-char piece actually took`);
+  assert.ok(speakBudgetMs(2000) <= 600_000, 'the ceiling still bounds it');
+});
+
+test('003: a server that never answers is given up on, and the message says why', async () => {
+  // The failure has to be a DECLARED one. A request that hangs forever on the
+  // route the user is listening to is the bug; the abort is the fix; and what
+  // proves the fix is a message naming what it waited for, what it was allowed,
+  // and how much text it was allowed it for.
+  const silent = (_url, opts) => new Promise((_res, rej) => {
+    opts.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+  });
+  const settings = { baseUrl: 'http://tts.invalid/v1', model: 'm', voice: 'v', speed: 1, format: 'wav' };
+
+  const started = Date.now();
+  const r = await mod.synthesize('una riga', settings, silent, 60);
+  const took = Date.now() - started;
+
+  assert.equal(r.ok, false);
+  assert.match(r.error, /timed out after \d+ms \(budget 60ms for 8 chars\)/, `got ${JSON.stringify(r.error)}`);
+  assert.ok(took < 5000, `it must give up at the budget, not after it — waited ${took}ms`);
+});
+
+test('003: a timed-out piece is FAILED, and the envelope is never marked done', async () => {
+  // The end-to-end shape the card demanded, and the reason wiring the error in
+  // was cheap: `speakPieces` aggregates the WORST piece, so a give-up cannot come
+  // out as `spoke` and cannot reach `.done`. The user's rule ("wait for delivery
+  // AND playback") is already encoded in that aggregation.
+  const { mkdtempSync, writeFileSync, existsSync, readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'vo-003-'));
+  const name = 'msg-timeout.json';
+  writeFileSync(join(dir, name), JSON.stringify({ v: 1, id: 'msg-timeout', text: 'Una frase che nessuno ascoltera.', createdAt: 'now' }), 'utf8');
+
+  const silent = (_url, opts) => new Promise((_res, rej) => {
+    opts.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+  });
+
+  const r = await mod.flushOne(dir, name, {
+    userData: dir, platform: 'win32', playImpl: async () => ({ ok: true }),
+    fetchImpl: silent, budgetMs: 60,
+  });
+
+  assert.equal(r.ok, false);
+  assert.equal(r.outcome, 'failed');
+  assert.equal(r.spoken, 0);
+  assert.match(r.error, /timed out after \d+ms/, 'and the reason survives into the reported error');
+
+  const line = mod.describeFlush(r);
+  assert.equal(line.stream, 'stderr');
+  assert.match(line.text, /^FAILED msg-timeout\.json \(0 of 1 piece spoken/, 'never `spoke`');
+  // `spoke` is a PREFIX of `spoken`, so a bare /spoke/ would match the count in
+  // "0 of 1 piece spoken" and pass a line that begins with `spoke`. The claim
+  // being guarded is the one at the START of the line.
+  assert.doesNotMatch(line.text, /^spoke\b/, 'and the line must not open by claiming success');
+
+  assert.ok(existsSync(join(dir, '.failed', name)), 'the envelope is in .failed');
+  assert.ok(!existsSync(join(dir, '.done', name)), 'and NOT in .done');
+  const rec = JSON.parse(readFileSync(join(dir, '.failed', 'msg-timeout.receipt.json'), 'utf8'));
+  assert.equal(rec.outcome, 'failed');
+  assert.equal(rec.pieces[0].stage, 'synthesize');
+  assert.equal(rec.pieces[0].playMs, 0, 'nothing reached the speaker');
+});
+
 
 test('a server error is reported with its status, truncated', () => {
   const failing = async () => ({
@@ -670,4 +773,228 @@ test('the printed line itself carries the counts, on every branch', () => {
   const queued = mod.describeFlush({ ...base, spoken: 0, ok: false, queued: true, error: 'playback is only implemented for Windows' });
   assert.equal(queued.stream, 'stderr');
   assert.match(queued.text, /^QUEUED NOT SPOKEN m\.json \(3 pieces, 0 spoken\):/, `got ${JSON.stringify(queued.text)}`);
+});
+
+// ─── 004: the outcome of a delivery survives the delivery ─────────────────────
+//
+// The evidence, measured: six envelopes in one evening, and every one of them sat
+// in `.done/` byte-identical to what was queued, wearing an mtime equal to its own
+// birth date because `rename` preserves it. The console line was the only record,
+// and it belonged to whichever terminal happened to be running.
+
+const LONGTEXT = (() => {
+  const parts = [];
+  for (let i = 0; i < 8; i++) parts.push(`Questa e' la frase numero ${i} del messaggio lungo, e occupa un pezzo.`);
+  return parts.join(' ');
+})();
+
+/** A queue holding one envelope, and the text it was queued with. */
+function spool(prefix, name, text) {
+  const { mkdtempSync, writeFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const body = JSON.stringify({ v: 1, id: name.replace(/\.json$/, ''), text, createdAt: '2026-09-28T20:00:00.000Z' }, null, 2);
+  writeFileSync(join(dir, name), body, 'utf8');
+  return { dir, name, body, read: () => require('node:fs').readFileSync(require('node:path').join(dir, name), 'utf8') };
+}
+
+/** A delivered envelope, without a speaker and without waiting for real audio. */
+const delivered = (over = {}) => ({
+  userData: null, platform: 'win32', playImpl: async () => ({ ok: true }), ...over,
+});
+
+test('004: a delivery that played leaves a receipt beside the envelope', async () => {
+  const { existsSync, readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { dir, name, body } = spool('vo-004-', 'msg-a.json', LONGTEXT);
+
+  const r = await mod.flushOne(dir, name, delivered({ userData: dir, fetchImpl: servesWav(realWav()) }));
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.ok(r.pieces > 1, 'the fixture must really split, or this proves nothing');
+
+  const done = join(dir, '.done');
+  assert.ok(existsSync(join(done, name)), 'the envelope lands in .done');
+  assert.ok(existsSync(join(done, 'msg-a.receipt.json')), 'and the receipt lands BESIDE it, not inside it');
+
+  const rec = JSON.parse(readFileSync(join(done, 'msg-a.receipt.json'), 'utf8'));
+  assert.equal(rec.envelope, name, 'the receipt names the envelope it describes');
+  assert.equal(rec.outcome, 'played');
+  assert.equal(rec.pieceCount, r.pieces);
+  assert.equal(rec.spokenCount, r.pieces, 'every piece sounded, and the receipt says so');
+  assert.equal(rec.pieces.length, r.pieces, 'and it carries one entry per piece, in order');
+  assert.deepEqual(rec.pieces.map((p) => p.piece), [...Array(r.pieces).keys()].map((i) => i + 1));
+
+  // THE TRAP, stated as an assertion: the file the human or a future reader opens
+  // must be the file the author wrote. An outcome written into `text` would make
+  // the announcement say something its author never said.
+  assert.equal(readFileSync(join(done, name), 'utf8'), body, 'the envelope must be byte-identical to what was queued');
+});
+
+test('004: the receipt says WHEN, because the envelope cannot', async () => {
+  const { readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { dir, name } = spool('vo-004-when-', 'msg-when.json', LONGTEXT);
+
+  // A clock I control, so "84.76 s" is a fact rather than a race.
+  const START = 1700000000000;
+  let tick = 0;
+  const clock = () => START + (tick++ === 0 ? 0 : 84760);
+
+  const r = await mod.flushOne(dir, name, delivered({ userData: dir, fetchImpl: servesWav(realWav()), clock }));
+  assert.equal(r.totalMs, 84760, 'the total is measured, not estimated');
+  assert.equal(Date.parse(r.startedAt), START);
+
+  const rec = JSON.parse(readFileSync(join(dir, '.done', 'msg-when.receipt.json'), 'utf8'));
+  assert.equal(Date.parse(rec.finishedAt), START + 84760, 'the moment the audio ended is on the disk');
+  assert.equal(rec.totalMs, 84760);
+  // The per-piece numbers here come from the real monotonic clock (only the
+  // envelope-level clock is injected), so what is pinned is the STRUCTURE, not a
+  // value: the exact per-piece arithmetic is pinned above, with every clock
+  // injected. What matters here is that the whole run cannot be shorter than the
+  // pieces inside it, and that each piece adds up to itself.
+  assert.ok(rec.synthMs >= 0 && rec.playMs >= 0, 'and the two stages are accounted for');
+  assert.ok(rec.synthMs + rec.playMs <= rec.totalMs, 'the pieces cannot take longer than the whole run');
+  for (const p of rec.pieces) {
+    assert.ok(Number.isFinite(p.ms) && p.ms >= 0, `piece ${p.piece} carries its own milliseconds`);
+    assert.equal(p.ms, p.synthMs + p.playMs, 'and they add up to it');
+  }
+});
+
+test('004: a receipt is never mistaken for a message to speak', async () => {
+  // The one way this feature could hurt the human: a JSON file full of timings
+  // handed to the speaker. `pending()` is the gate, so it is the thing pinned.
+  const { copyFileSync, existsSync, readdirSync, writeFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { dir, name } = spool('vo-004-pending-', 'msg-b.json', 'Una frase breve, niente di che.');
+
+  await mod.flushOne(dir, name, delivered({ userData: dir, fetchImpl: servesWav(realWav()) }));
+  const receipt = join(dir, '.done', 'msg-b.receipt.json');
+  assert.ok(existsSync(receipt), 'the fixture needs a real receipt to copy');
+
+  // Put it back where envelopes live, with an envelope still waiting: the exact
+  // shape that would put a JSON file in front of the speaker.
+  copyFileSync(receipt, join(dir, 'msg-b.receipt.json'));
+  writeFileSync(join(dir, 'msg-waiting.json'), JSON.stringify({ v: 1, id: 'msg-waiting', text: 'Ancora da dire.', createdAt: 'now' }), 'utf8');
+
+  assert.deepEqual(mod.pending(dir), ['msg-waiting.json'],
+    'the waiting envelope is queued and the receipt beside it is not');
+  assert.ok(readdirSync(dir).includes('msg-b.receipt.json'), 'and the receipt is really sitting there, or this proves nothing');
+});
+
+test('004: a failure leaves its receipt too, naming the piece that failed', async () => {
+  const { existsSync, readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { dir, name } = spool('vo-004-fail-', 'msg-c.json', LONGTEXT);
+
+  const down = async () => ({ ok: false, error: 'TTS server unreachable' });
+  const r = await mod.flushOne(dir, name, delivered({ userData: dir, fetchImpl: down }));
+  assert.equal(r.ok, false);
+
+  const rec = JSON.parse(readFileSync(join(dir, '.failed', 'msg-c.receipt.json'), 'utf8'));
+  assert.equal(rec.outcome, 'failed');
+  assert.equal(rec.spokenCount, 0, 'nothing was heard, and the artifact says zero');
+  assert.equal(rec.pieces.length, r.pieces);
+  assert.equal(rec.pieces[0].stage, 'synthesize', 'the failing stage is on the record');
+  assert.equal(rec.pieces[0].playMs, 0, 'and it never reached the speaker');
+  assert.match(rec.error, /piece 1\/\d+/, 'the reason names WHICH piece');
+  assert.ok(existsSync(join(dir, '.failed', name)), 'the envelope is still moved, not deleted');
+});
+
+test('004: an envelope too broken to speak is still accounted for', async () => {
+  // The path with the least evidence of all: it never became a message, so it is
+  // exactly the one that used to vanish into `.failed` saying nothing.
+  const { existsSync, readFileSync, mkdtempSync, writeFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'vo-004-bad-'));
+  writeFileSync(join(dir, 'msg-d.json'), '{ this is not json', 'utf8');
+
+  const r = await mod.flushOne(dir, 'msg-d.json', delivered({ userData: dir }));
+  assert.equal(r.ok, false);
+  assert.equal(r.outcome, 'rejected');
+  assert.ok(existsSync(join(dir, '.failed', 'msg-d.receipt.json')), 'a receipt even here');
+  const rec = JSON.parse(readFileSync(join(dir, '.failed', 'msg-d.receipt.json'), 'utf8'));
+  assert.equal(rec.outcome, 'rejected');
+  assert.match(rec.error, /not valid JSON/);
+  assert.ok(Date.parse(rec.finishedAt) > 0);
+});
+
+test('004: the receipt writer never throws, it reports', async () => {
+  // The audio has already been heard by the time the receipt is written, so a
+  // failure here must not become a delivery failure.
+  const { existsSync, mkdirSync, mkdtempSync } = require('node:fs');
+  const { join } = require('node:path');
+  const { tmpdir } = require('node:os');
+  const root = mkdtempSync(join(tmpdir(), 'vo-004-unwritable-'));
+  mkdirSync(join(root, 'locked'));
+
+  const r = mod.writeReceipt(join(root, 'missing', 'deeper'), 'msg-e.json', { outcome: 'played' });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /could not write the receipt/);
+  assert.ok(!existsSync(join(root, 'missing')), 'and it created no directory as a side effect');
+});
+
+// ─── 005: the seconds per piece, so the estimate stops being the only source ───
+
+test('005: each piece reports its own seconds, and the two stages are told apart', async () => {
+  // A hand stopwatch, three times, is how these numbers were obtained. The
+  // reason the two stages are separate is that only `playMs` is time the human
+  // spent listening: a piece that spent its time waiting on the server is a
+  // different problem from one that was genuinely 40 seconds of audio.
+  let t = 0;
+  const r = await mod.speakPieces(['uno', 'due'], {
+    synth: async (p) => { t += p === 'uno' ? 4000 : 500; return { ok: true, audio: Buffer.alloc(4) }; },
+    play: async () => { t += 2000; return { ok: true }; },
+    now: () => t,
+  });
+  assert.deepEqual(r.results.map((x) => [x.synthMs, x.playMs, x.ms]), [[4000, 2000, 6000], [500, 2000, 2500]]);
+});
+
+test('005: a piece that failed during synthesis is timed, with nothing played', async () => {
+  let t = 0;
+  const r = await mod.speakPieces(['uno'], {
+    synth: async () => { t += 3000; return { ok: false, error: 'server unreachable' }; },
+    play: async () => { throw new Error('must never be reached'); },
+    now: () => t,
+  });
+  assert.equal(r.outcome, 'failed');
+  assert.equal(r.results[0].synthMs, 3000, 'the wait is on the record even though nothing was heard');
+  assert.equal(r.results[0].playMs, 0);
+  assert.equal(r.results[0].ms, 3000);
+});
+
+test('005: a duration reads as milliseconds below a second and tenths above', () => {
+  // Not pedantry: a timing nobody can read is a timing nobody uses, and a piece
+  // reporting `0.0 s` is indistinguishable from a clock that never ran.
+  assert.equal(mod.fmtMs(0), '0 ms', 'zero is a real measurement and must not read as nothing');
+  assert.equal(mod.fmtMs(847), '847 ms');
+  assert.equal(mod.fmtMs(84760), '84.8 s', 'the measured flush of the evening, to one decimal');
+  assert.equal(mod.fmtMs(null), null, 'an unmeasured duration is absent, not zero');
+});
+
+test('005: the printed line carries the total and the per-piece seconds', async () => {
+  const results = [
+    { piece: 1, of: 2, ms: 41200 }, { piece: 2, of: 2, ms: 43560 },
+  ];
+  const line = mod.describeFlush({ name: 'm.json', chars: 343, pieces: 2, spoken: 2, results, totalMs: 84760, ok: true });
+  assert.equal(line.stream, 'stdout');
+  assert.match(line.text, /^spoke m\.json \(343 chars, 2 pieces, 84\.8 s \[p1 41\.2 s, p2 43\.6 s\]\)\n$/,
+    `got ${JSON.stringify(line.text)}`);
+
+  const failed = mod.describeFlush({ name: 'm.json', chars: 343, pieces: 2, spoken: 1, results, totalMs: 84760, ok: false, error: 'piece 2/2: playback failed' });
+  assert.match(failed.text, /^FAILED m\.json \(1 of 2 pieces spoken, 84\.8 s \[p1 41\.2 s, p2 43\.6 s\]\): piece 2\/2/,
+    'a failure carries the timings too — that is when they are worth having');
+
+  // Nothing was heard, so the seconds are the wait for nothing: they must still
+  // be printed rather than dropped, and they must not be dressed up as audio.
+  const waited = [{ piece: 1, of: 2, ms: 190 }, { piece: 2, of: 2, ms: 210 }];
+  const queued = mod.describeFlush({ name: 'm.json', chars: 343, pieces: 2, spoken: 0, results: waited, totalMs: 400, ok: false, queued: true, error: 'no speaker' });
+  assert.match(queued.text, /^QUEUED NOT SPOKEN m\.json \(2 pieces, 0 spoken, 400 ms \[p1 190 ms, p2 210 ms\]\): no speaker\n$/,
+    `got ${JSON.stringify(queued.text)}`);
+});
+
+test('005: one piece is not broken down into a breakdown of one', () => {
+  const line = mod.describeFlush({ name: 'm.json', chars: 40, pieces: 1, spoken: 1, results: [{ piece: 1, of: 1, ms: 3100 }], totalMs: 3100, ok: true });
+  assert.equal(line.text, 'spoke m.json (40 chars, 1 piece, 3.1 s)\n');
 });

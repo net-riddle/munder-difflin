@@ -41,6 +41,8 @@ const PKG = path.join(TEST_DIR, '..', 'package.json');
 const KNOWN_OUTSIDE_THE_GLOB = {
   'load-ts.cjs':
     'helper: transpiles a .ts module for a test to require. Required by ~80 test files; running it asserts nothing.',
+  'home-sandbox.cjs':
+    "helper: gives a test a throwaway home on every platform. Sets $HOME AND $USERPROFILE and refuses to run if os.homedir() did not move — $HOME alone is ignored on Windows, so a test using only that believed it was isolated and probed the real ~/.claude instead. Running it asserts nothing.",
   'fixtures\\quit-sweep-main.cjs':
     "fixture: launched as Electron's MAIN script by quit-sweep.electron.test.cjs. Must NOT run as a test: under bare node `app` is undefined and it throws at its own line 77.",
 };

@@ -37,7 +37,22 @@ test('consecutive agent caps survive an interleaved config update', () => {
     jim: 100,
     pam: 200
   });
-  assert.deepEqual(config.registeredRepos, ['/workspace/project']);
+  // The claim here is that an interleaved write of ANOTHER field leaves
+  // `registeredRepos` alone. Asserting the exact string asserted something else:
+  // that a repo path is stored verbatim — and it is not, and never was.
+  //
+  // VERDICT (2026-08-07 vs 2026-08-19, from git log): the expectation stopped
+  // describing the product. `writeConfig` has mapped every registered repo through
+  // `expandTilde` since 913b8ad8, 2026-08-07 — twelve days before this assertion was
+  // written in d41eee90. So it never held on Windows: `/workspace/project` resolves
+  // against the current drive and comes back `F:\workspace\project`. Not a
+  // regression; the product predates the expectation.
+  //
+  // What survives the interleaved write is still checked — one repo, still the one
+  // that was written — but by what identifies it rather than by a spelling that
+  // belongs to one platform.
+  assert.equal(config.registeredRepos.length, 1, 'the interleaved write must not drop the repo');
+  assert.equal(path.basename(config.registeredRepos[0]), 'project');
 });
 
 test('setting and clearing caps use the latest persisted map', () => {

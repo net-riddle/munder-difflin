@@ -17,6 +17,24 @@ const { installInfoForProvider } = loadTs('src/shared/agentProvider.ts');
 const script = (provider, npmAvailable, platform) =>
   buildMissingCliScript(provider, provider, npmAvailable, platform);
 
+/**
+ * The SCRIPT'S STATEMENTS, not its lines.
+ *
+ * cmd.exe separates statements with `&`, and the Windows script is deliberately a
+ * single line — a sibling test in this file pins that, because the script is
+ * wrapped verbatim in `cmd /d /s /c "…"`. So `out.split('\n')` returns one element
+ * on Windows and can never find an executed statement in it: the native command is
+ * in there, twice, once inside an `echo` and once on its own after `echo. &`.
+ *
+ * That distinction is the whole point of the test below — "actually runs, not only
+ * echoed" — so splitting has to follow the platform's separator or the test stops
+ * being able to see the difference it exists to check.
+ */
+const statements = (out, platform) =>
+  (platform === 'win32' ? out.split(/\r?\n|&/) : out.split(/\r?\n/))
+    .map((s) => s.trim())
+    .filter(Boolean);
+
 test('with npm present the ladder is unchanged — npm install, for every provider', () => {
   for (const provider of ['claude', 'codex', 'gemini', 'opencode', 'crush', 'copilot']) {
     const info = installInfoForProvider(provider);
@@ -66,16 +84,31 @@ test('the no-node script explains the real problem instead of failing at it', ()
 });
 
 test('the native rung actually runs, and says why it differs', () => {
-  const out = script('claude', false);
-  assert.match(out, /no Node needed/);
-  const native = installInfoForProvider('claude').nativeCommand;
-  assert.ok(out.split('\n').includes(native), 'the installer must be an executed line, not only echoed');
+  // BOTH platforms, explicitly, and with the provider info asked about the same
+  // platform. Two bugs used to hide in here at once: the statement split above,
+  // and `installInfoForProvider('claude')` with no platform — which returns the
+  // Windows command, so on a POSIX machine this compared a PowerShell line against
+  // a curl script. The test passed by accident on exactly one machine.
+  for (const platform of ['linux', 'win32']) {
+    const out = script('claude', false, platform);
+    assert.match(out, /no Node needed/, platform);
+    const native = installInfoForProvider('claude', platform).nativeCommand;
+    assert.ok(
+      statements(out, platform).includes(native),
+      `${platform}: the installer must be an executed statement, not only echoed — script was: ${out}`
+    );
+  }
 });
 
 test('with npm present nothing mentions a missing Node', () => {
-  const out = script('claude', true);
-  assert.doesNotMatch(out, /Node\.js is not installed/);
-  assert.ok(out.split('\n').includes('npm install -g @anthropic-ai/claude-code'));
+  for (const platform of ['linux', 'win32']) {
+    const out = script('claude', true, platform);
+    assert.doesNotMatch(out, /Node\.js is not installed/, platform);
+    assert.ok(
+      statements(out, platform).includes('npm install -g @anthropic-ai/claude-code'),
+      `${platform}: npm install must be an executed statement, not only echoed — script was: ${out}`
+    );
+  }
 });
 
 test('the Windows script stays a single quote-free cmd.exe line', () => {

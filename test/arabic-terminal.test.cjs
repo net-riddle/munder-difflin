@@ -13,7 +13,32 @@ const loadTs = require('./load-ts.cjs');
 
 const { arabicJoinRanges, isArabicCp } = loadTs('src/renderer/src/terminal/arabicJoiner.ts');
 const root = path.join(__dirname, '..');
-const read = (p) => fs.readFileSync(path.join(root, p), 'utf8');
+// Normalised to LF on the way in: every source file in these directories is CRLF,
+// and a test that reasons about lines has to agree with the file about what a
+// line is. See `bodyOf` for what that cost us.
+const read = (p) => fs.readFileSync(path.join(root, p), 'utf8').replace(/\r\n/g, '\n');
+
+/**
+ * The source text of one top-level function, from its declaration to the
+ * column-0 brace that closes it.
+ *
+ * The obvious `src.slice(i, src.indexOf('\n}\n', i))` is a trap in a CRLF file:
+ * `'\n}\n'` never occurs there, `indexOf` returns -1, and `slice(0, -1)` quietly
+ * returns THE ENTIRE REST OF THE FILE. Measured on terminalPool.ts: the slice was
+ * 15,398 characters where `disableArabicRendering` is 326, and 16,292 where
+ * `enableArabicRendering` is 739.
+ *
+ * Both ends are asserted rather than assumed. A helper that cannot find its end
+ * must fail the test loudly — the failure mode it replaces was a test that read
+ * green while checking nothing.
+ */
+const bodyOf = (src, decl) => {
+  const from = src.indexOf(decl);
+  assert.ok(from >= 0, `${decl} is not in this file at all`);
+  const end = src.indexOf('\n}', from);
+  assert.ok(end > from, `${decl} has no column-0 closing brace to end at`);
+  return src.slice(from, end + 2);
+};
 
 const HELLO_AR = 'مرحبا'; // 5 Arabic letters, U+0645 U+0631 U+062D U+0628 U+0627
 
@@ -114,8 +139,7 @@ test('nothing Arabic is wired into a terminal unless the setting says so', () =>
   // attach and the live language switch cannot drift apart. The guarantee is
   // unchanged: nothing reaches a terminal except through that one function, and
   // every call to it is behind isArabicTerminalEnabled().
-  const fn = src.slice(src.indexOf('function enableArabicRendering'));
-  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  const body = bodyOf(src, 'function enableArabicRendering');
   for (const call of ['registerCharacterJoiner(', 'attachArabicSpacingFix(entry.host)', "classList.add('cth-bidi')"]) {
     assert.ok(body.includes(call), `${call} is not in enableArabicRendering`);
     const occurrences = src.split(call).length - 1
@@ -135,13 +159,12 @@ test('turning it off is a real undo, not a terminal rebuild', () => {
   // resend it, so recreating one to apply a setting would silently eat the
   // user's history. Every step of enableArabicRendering has to be reversible.
   const src = read('src/renderer/src/components/terminalPool.ts');
-  const off = src.slice(src.indexOf('function disableArabicRendering'));
-  const body = off.slice(0, off.indexOf('\n}\n'));
+  const body = bodyOf(src, 'function disableArabicRendering');
   assert.match(body, /deregisterCharacterJoiner/, 'the joiner is never removed');
   assert.match(body, /classList\.remove\('cth-bidi'\)/, 'the bidi class is never removed');
   assert.match(body, /detachSpacing\(\)/, 'the spacing observer is never detached');
-  const sweep = src.slice(src.indexOf('export function notifyArabicTerminalChangeAll'));
-  assert.doesNotMatch(sweep.slice(0, sweep.indexOf('\n}\n')), /\bterm\.dispose\b|acquireTerminal/,
+  const sweep = bodyOf(src, 'export function notifyArabicTerminalChangeAll');
+  assert.doesNotMatch(sweep, /\bterm\.dispose\b|acquireTerminal/,
     'the live switch must not dispose or recreate a terminal');
 });
 
