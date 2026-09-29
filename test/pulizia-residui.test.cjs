@@ -20,6 +20,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
+const { spawnSync } = require('node:child_process');
 
 const SKILL = 'F:/workspace/projects/munder-difflin/resources/skills/pulizia_residui_lavorazione/pulizia.mjs';
 
@@ -184,3 +185,202 @@ test('100: the floor\'s memory, the inbox archive and the identities are never c
 function puliziaResidui() {
   return path.join('skills', 'pulizia_residui_lavorazione');
 }
+
+// ══ 101 — LA PROVA `rigenerabile` ══
+//
+// The card names the trap first and it is the whole design: «se la prova copre
+// troppo, la skill propone il sorgente». So these tests are built around the two
+// ways a proof like this lies, and a proof that cannot fail is a rule that cannot
+// be wrong:
+//
+//   A) a file git IGNORES is not a file a command rebuilds. `*.log`, `.env`,
+//      `docs/blog-preview-*/` are all ignored and none of them comes back from
+//      anything. If `rigenerabile` answered YES on those it would be `fuori uso`
+//      with a new name, one level up — and `fuori uso` already proposed 4 218 of
+//      4 218 files on its first real run.
+//   B) a file git TRACKS is content whatever directory it sits in. That is why
+//      `check-ignore` is called WITHOUT `--no-index`: the refusal is the proof.
+//
+// The fixtures are real git repositories, because the whole point of the proof is
+// that it asks the repository. A mocked git would test the mock.
+
+/** A real git repo, so `check-ignore` has a real opinion to give. */
+function repoGit(t, gitignore) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pulizia-git-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const git = (...args) => {
+    const r = spawnSync('git', args, { cwd: home, encoding: 'utf8', windowsHide: true });
+    assert.equal(r.status, 0, 'git ' + args.join(' ') + ': ' + (r.stderr || r.error));
+    return r.stdout;
+  };
+  git('init', '-q');
+  git('config', 'user.email', 'prova@pulizia.test');
+  git('config', 'user.name', 'prova');
+  if (gitignore) fs.writeFileSync(path.join(home, '.gitignore'), gitignore, 'utf8');
+  const scrivi = (rel, contenuto = CONTENUTO) => {
+    const p = path.join(home, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, contenuto, 'utf8');
+    return p;
+  };
+  return { home, scrivi, git };
+}
+
+test('101: a file a declared command rebuilds IS proposed, and the manifest names the command', (t) => {
+  const { home, scrivi, git } = repoGit(t, 'out/\n');
+  // The repository declares `out/` generated, and there is a `build` script: the
+  // two facts, plus the contract entry, are the proof.
+  const artefatto = scrivi('out/main/index.js', 'compiled ' + 'x'.repeat(2000));
+  scrivi('package.json', JSON.stringify({ name: 'x', scripts: { build: 'vite build' } }));
+  git('add', '-A');
+  git('commit', '-q', '-m', 'sorgente');
+
+  const p = costruisciPiano({
+    roots: [home], dichiarati: new Set(), nomiLetti: new Set(), carte: { ok: true, carte: [], motivo: '' },
+    uscite: [{ radice: home, dir: 'out', script: 'build', perche: 'vite build', verificatoIl: '2026-09-30 — prova' }]
+  });
+
+  const trovato = p.proposte.find((q) => q.path === artefatto);
+  assert.ok(trovato, 'IT IS PROPOSED. `rigenerabile` is the second of the two authorising proofs, and with only `gemello` this file is a build artefact that no twin explains — which is precisely where the first real run stopped.');
+  assert.equal(trovato.prova, 'rigenerabile');
+  assert.equal(trovato.comando, 'npm run build', 'and the manifest says HOW TO PUT IT BACK, because a proposal nobody can reverse is a proposal, not a cleanup');
+  assert.equal(p.rigenerabili.length, 1);
+  assert.equal(p.rigenerabili[0].gruppo, 'out');
+  assert.equal(p.rigenerabili[0].file, 1);
+  assert.ok(p.contatori.byteRigenerabili > 0);
+});
+
+test('101: THE FALSIFICATION — a git-ignored file OUTSIDE every declared output is NOT proposed', (t) => {
+  const { home, scrivi, git } = repoGit(t, '*.log\n.env\ndocs/blog-preview-*/\n');
+  // Ignored by the repository, and rebuilt by NOTHING. These are the files that
+  // turn a proof into `fuori uso` again: they pass the "git says generated" test
+  // and fail the one that matters.
+  const ignorati = [
+    scrivi('debug.log', CONTENUTO),
+    scrivi('.env', 'TOKEN=non-cancellare\n'),
+    scrivi('docs/blog-preview-x/index.html', CONTENUTO)
+  ];
+  scrivi('package.json', JSON.stringify({ name: 'x', scripts: { build: 'vite build' } }));
+  git('add', '-A');
+  git('commit', '-q', '-m', 'sorgente');
+
+  const p = costruisciPiano({
+    roots: [home], dichiarati: new Set(), nomiLetti: new Set(), carte: { ok: true, carte: [], motivo: '' },
+    uscite: [{ radice: home, dir: 'out', script: 'build', perche: 'vite build', verificatoIl: '2026-09-30 — prova' }]
+  });
+
+  for (const q of ignorati) {
+    assert.equal(p.proposte.some((r) => r.path === q), false,
+      'IGNORED IS NOT REGENERABLE. `.gitignore` says "not content"; it does not say "a command puts this back". Answering YES here is the bug this skill already shipped once, one level up: absence of a reference was not derivation, and absence of a reference from git is not regeneration.');
+  }
+  assert.equal(p.proposte.length, 0, 'nothing at all: ' + JSON.stringify(p.proposte.map((q) => q.path)));
+});
+
+test('101: a TRACKED file inside a declared output directory is NOT proposed', (t) => {
+  // `out/*` and NOT `out/`, and that difference is measured, not stylistic: git
+  // does not descend into an excluded directory, so a negation under `out/` never
+  // applies and `out/tenuto.ts` stays ignored like its siblings. The first version
+  // of this fixture used `out/` + `!out/tenuto.ts`, the negation was inert, and the
+  // test went red complaining that the skill had deleted a tracked file — when the
+  // skill was right and the fixture was fiction. *A test that fails for a reason
+  // its author did not check is not evidence about the code.*
+  const { home, scrivi, git } = repoGit(t, 'out/*\n!out/tenuto.ts\n');
+  // `out/` is declared generated, and the repository then says «except this one».
+  // A tracked file is content whatever directory it lives in, and this is the case
+  // the four `.opencode` trees are in: git tracks them, so the proof must not touch
+  // them, and nobody has to decide that by hand.
+  const tenuto = scrivi('out/tenuto.ts', 'export const a = 1;\n');
+  scrivi('out/main/index.js', 'compiled ' + 'x'.repeat(2000));
+  scrivi('package.json', JSON.stringify({ name: 'x', scripts: { build: 'vite build' } }));
+  // No `-f`: the negation in `.gitignore` is what stages `out/tenuto.ts`, and
+  // `out/main/index.js` stays untracked. Force-adding everything would have made
+  // BOTH tracked and quietly removed the difference this test is about.
+  git('add', '-A');
+  git('commit', '-q', '-m', 'sorgente');
+  assert.ok(git('ls-files').includes('out/tenuto.ts'),
+    'the fixture really is tracking the file, otherwise this test asserts nothing');
+
+  const p = costruisciPiano({
+    roots: [home], dichiarati: new Set(), nomiLetti: new Set(), carte: { ok: true, carte: [], motivo: '' },
+    uscite: [{ radice: home, dir: 'out', script: 'build', perche: 'vite build', verificatoIl: '2026-09-30 — prova' }]
+  });
+
+  assert.equal(p.proposte.some((q) => q.path === tenuto), false,
+    'GIT TRACKS IT, SO IT IS CONTENT. `check-ignore` is called without `--no-index` precisely so that a tracked file cannot be called generated; that omission is the whole of the second falsification.');
+  assert.ok(p.proposte.some((q) => q.path.endsWith('index.js')),
+    'and the untracked sibling in the SAME directory is still proposed: the proof reads the repository per path, it does not blacklist a whole tree because of what sits in it');
+});
+
+test('101: the proof can FAIL — with the command gone, the same file is not proposed', (t) => {
+  const { home, scrivi, git } = repoGit(t, 'out/\n');
+  const artefatto = scrivi('out/main/index.js', 'compiled ' + 'x'.repeat(2000));
+  // A `package.json` with no `build` script: the contract entry is stale, so the
+  // claim is dropped and nothing is proposed. *A proof that cannot fail is a rule
+  // that cannot be wrong, and neither of those is a thing you want in a command
+  // that deletes files.*
+  scrivi('package.json', JSON.stringify({ name: 'x', scripts: { test: 'node --test' } }));
+  git('add', '-A');
+  git('commit', '-q', '-m', 'sorgente');
+
+  const opts = {
+    roots: [home], dichiarati: new Set(), nomiLetti: new Set(), carte: { ok: true, carte: [], motivo: '' },
+    uscite: [{ radice: home, dir: 'out', script: 'build', perche: 'vite build', verificatoIl: '2026-09-30 — prova' }]
+  };
+  const senza = costruisciPiano(opts);
+  assert.equal(senza.proposte.some((q) => q.path === artefatto), false,
+    'no rebuild command, no authorisation. A contract that names a script the repository does not have is a claim about a command that cannot run, and the direction this skill must be wrong in is «do not delete».');
+
+  // …and the same fixture, with the script restored, goes green again. A test that
+  // only ever sees the negative proves that something is broken, not what works.
+  fs.writeFileSync(path.join(home, 'package.json'),
+    JSON.stringify({ name: 'x', scripts: { build: 'vite build', test: 'node --test' } }), 'utf8');
+  const con = costruisciPiano(opts);
+  assert.ok(con.proposte.some((q) => q.path === artefatto),
+    'and the proof is not merely absent-by-default: the very same file is proposed as soon as the declared command exists again');
+});
+
+test('101: a floor that is not a git repository at all proposes NOTHING by this proof', (t) => {
+  const { scrivi, proposte } = piano(t);
+  // The synthetic floor of the cases above has no `.git`, so `check-ignore` cannot
+  // answer. An inconclusive scan is not a permission: the answer has to be "no".
+  const finto = scrivi('out/main/index.js', CONTENUTO);
+  const prop = proposte();
+  assert.equal(prop.some((q) => q.path === finto), false,
+    'NOT KNOWING IS NOT YES. This is the same distinction `carteAperte()` draws for the ledger, and it is the reason the ledger branch closes the plan instead of emptying it.');
+});
+
+// ── THE ONE THAT ONLY THE REAL FLOOR FOUND ───────────────────────────────
+
+test('101: a root spelled with FORWARD slashes still finds its files, which walk() gave BACKSLASHES', (t) => {
+  // THE REAL FLOOR HAD 0 AND SAID NOTHING. `ROOTS` holds `MUNDER` as
+  // `F:/workspace/projects/munder-difflin` — forward slashes, a string constant —
+  // while `walk()` hands back `F:\workspace\...\out\main\index.js`. The filter that
+  // picked the candidates to ask git about compared those two directly, matched
+  // nothing, asked git about zero files, and the proof reported `rigenerabile: 0`
+  // with no error and a green suite.
+  //
+  // The five tests above could not have caught it: `fs.mkdtempSync` returns
+  // backslashes and `path.join` keeps them, so root and children agreed on their
+  // separators and the comparison was accidentally true. *A test built on one shape
+  // cannot see a bug that only another shape has — and this is the second time this
+  // skill has shipped a path rule that did not match the paths it was given.*
+  const { home, scrivi, git } = repoGit(t, 'out/\n');
+  const artefatto = scrivi('out/main/index.js', 'compiled ' + 'x'.repeat(2000));
+  scrivi('package.json', JSON.stringify({ name: 'x', scripts: { build: 'vite build' } }));
+  git('add', '-A');
+  git('commit', '-q', '-m', 'sorgente');
+
+  // The root exactly as a constant is written in the source, separators and all.
+  const radice = home.replace(/\\/g, '/');
+  assert.ok(radice.includes('/'), 'the fixture must really be spelled with forward slashes');
+  assert.ok(artefatto.includes('\\'), 'and the walked path really must contain a backslash');
+
+  const p = costruisciPiano({
+    roots: [radice], dichiarati: new Set(), nomiLetti: new Set(), carte: { ok: true, carte: [], motivo: '' },
+    uscite: [{ radice, dir: 'out', script: 'build', perche: 'vite build', verificatoIl: '2026-09-30 — prova' }]
+  });
+
+  assert.ok(p.proposte.some((q) => q.path === artefatto),
+    'THE PROOF HAS TO REACH THE FILES. A comparison between two spellings of the same place is a comparison that does not match, and "no file matched" is indistinguishable from "no file is generated" unless you build the floor the way the real one is built.');
+});
+

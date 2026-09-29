@@ -44,9 +44,10 @@
  */
 
 import { readdirSync, readFileSync, writeFileSync, statSync, existsSync, unlinkSync, mkdirSync } from 'node:fs';
-import { join, relative, basename, resolve } from 'node:path';
+import { join, relative, basename, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 // ──Roots─────────────────────────────────────────────────────────────────────
 const HIVE = 'F:/workspace/projects/ai-office/nemesi-office/hive';
@@ -56,8 +57,22 @@ const ROOTS = [HIVE, MUNDER];
 /** How old a --dry-run manifest may be before --applica refuses it. */
 export const MAX_AGE_GIORNI = 7;
 
-/** Directories that hold DERIVED copies. A twin in one of these is a copy. */
-const COPY_DIRS = ['.opencode', '.claude', 'out', 'dist', 'build'];
+/**
+ * Directories that hold DERIVED copies. A twin in one of these is a copy.
+ *
+ * `build` WAS in this list and the list was wrong, and it is worth writing down
+ * why, because "it is called build" is exactly the reasoning that put it there.
+ * In `munder-difflin`, `build/` holds **8 files tracked by git** — `icon.icns`,
+ * `notarize.cjs`, `SIGNING.md` — and **0 untracked ones**. It is signing material
+ * and packaging configuration somebody typed: source. The real build output is
+ * `out/`, which has 0 tracked files and is named by `.gitignore` line 3.
+ *
+ * So the rule this list actually encodes is not "looks generated", it is
+ * "somebody else's copy of the bytes". A directory that git TRACKS is by
+ * definition content, whatever it is called. *A name is not a derivation, and a
+ * list built from names is a list of guesses with a loop.*
+ */
+const COPY_DIRS = ['.opencode', '.claude', 'out', 'dist'];
 
 // ══ LA LISTA DI «NON CANCELLARE MAI» — un contratto, scritto qui e non in un
 // messaggio, perché un messaggio archiviato sparisce e un contratto no. ══
@@ -83,7 +98,160 @@ const MAI_PER_TASTO = [
   { per: /(^|\/)msg-[^/]*\.json$/, perche: 'a voice envelope' }
 ];
 
+// ══ IL CONTRATTO DELLE USCITE ══
+//
+// Il nome di una directory non prova niente, e questa skill lo ha gia' imparato
+// nel modo peggiore: `build/` era nella lista delle directory di copia perche' si
+// chiama `build`, e conteneva 8 file tracciati che qualcuno aveva scritto. Quindi
+// qui non si indovina: si DICHIARA, e ogni voce dichiarata viene verificata due
+// volte all'avvio — la directory deve esistere come uscita reale e il comando che
+// la rilancia deve esistere fra gli script di `package.json`.
+//
+// E' un contratto, come `MAI_PER_NOME`: sta in un file che non sparisce, non in un
+// messaggio archiviato. Una voce sbagliata qui non cancella niente da sola — toglie
+// solo la qualita' di «prova» a una cancellazione, quindi un contratto falso
+// degrada verso «non si cancella», che e' la direzione in cui questa skill deve
+// sbagliare.
+//
+// LA RIGA CHE MANCA, e che e' il punto 2 della card: «il file sembra generato» e'
+// un GIUDIZIO. Il criterio verificabile e' che il file SPARISCE quando si pulisce
+// l'artefatto e TORNA quando si rilancia. Percio' ogni voce porta la data della
+// verifica empirica fatta a mano, e quella data e' la parte che la rende una prova
+// e non un'asserzione: senza di lei questa tabella sarebbe una lista di buone
+// intenzioni.
+
+/** @type {{radice:string, dir:string, script:string, perche:string, verificatoIl:string}[]} */
+export const USCITE_DICHIARATE = [
+  {
+    radice: MUNDER,
+    dir: 'out',
+    script: 'build',
+    perche: 'electron-vite build && npm run copy:main-assets',
+    verificatoIl: '2026-09-30 — rimossa la directory out/ e rilanciato `npm run build` (55,8 s): 115 file e 31 669 367 byte, cioe\' TUTTO quello che c\'era, piu\' 110 file di out/renderer che PRIMA non c\'erano. Il conto di «5 file» che avevo scritto prima era uno stato parziale, non la dimensione di out/ — *un numero letto al momento sbagliato e\' la forma piu\' economica di mentire, perche\' e\' un numero vero letto troppo tardi*'
+  }
+];
+
+/**
+ * The contract, minus every entry whose rebuild command does not exist.
+ *
+ * An entry whose `package.json` cannot be read is DROPPED, not assumed. "I could
+ * not read the scripts" is not "there are no build scripts", and the difference is
+ * the difference between a claim and a shrug — the same distinction `carteAperte()`
+ * draws for the ledger, for the same reason.
+ */
+export function usciteValide(voci = USCITE_DICHIARATE) {
+  const valide = [];
+  for (const v of voci) {
+    let pkg;
+    try { pkg = JSON.parse(readFileSync(join(v.radice, 'package.json'), 'utf8')); }
+    catch { continue; }
+    const scripts = (pkg && pkg.scripts) || {};
+    if (!Object.prototype.hasOwnProperty.call(scripts, v.script)) continue;
+    if (!existsSync(join(v.radice, v.dir))) continue;
+    valide.push(v);
+  }
+  return valide;
+}
+
+/**
+ * Ask the REPOSITORY which of these paths it declares generated — in one call.
+ *
+ * Why `git check-ignore` and not a regex of mine: this skill already shipped the
+ * bug where a hand-written path rule never matched the paths it was given (the
+ * `.done` rule was written with `/`, the paths arrived with `\`), and the only
+ * reason nothing was deleted was a second bug that happened to stop it. *A
+ * protection list that does not match the paths it is given is not a protection
+ * list, it is a comment.* The same applies to a proof: `.gitignore` semantics are
+ * git's to answer, and asking git is cheaper and more honest than re-deriving them.
+ *
+ * `--stdin` because of the 100's other lesson: a proof that costs a spawn per file
+ * is a stall with a justification attached. This is one spawn per root.
+ *
+ * NO `--no-index`, and that omission is load-bearing. Without it `check-ignore`
+ * refuses to call a TRACKED file ignored — which is exactly the refusal we want: a
+ * file git tracks is content, and the four `.opencode` trees in `hive/agents/<id>/`
+ * are tracked, so this proof leaves them alone without anybody having to decide so.
+ *
+ * A root that is not a git work tree, or a git that is not installed, yields
+ * `conosciuto: false` and an empty set: the answer becomes "no", never "yes".
+ * An inconclusive scan is not a permission.
+ */
+function dichiaratiGeneratiDaGit(radice, assoluti) {
+  const perRel = new Map();
+  for (const p of assoluti) {
+    const rel = relative(radice, p).replace(/\\/g, '/');
+    if (!rel || rel.startsWith('../')) continue;
+    perRel.set(rel, p);
+  }
+  if (!perRel.size) return { conosciuto: false, set: new Set() };
+  const r = spawnSync('git', ['check-ignore', '--stdin'], {
+    cwd: radice,
+    input: [...perRel.keys()].join('\n') + '\n',
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    windowsHide: true
+  });
+  if (r.error || r.status === 128) return { conosciuto: false, set: new Set() };
+  const set = new Set();
+  for (const riga of String(r.stdout || '').split('\n')) {
+    // Trim first, then unquote. Git on Windows can end a line with CR, and a path
+    // that ends in CR is not the path we asked about — an earlier measurement of
+    // mine was misled by exactly that, and the symptom was a tool that reported
+    // "nothing is ignored" for a directory git had just told me it ignores.
+    const grezza = riga.replace(/\r$/, '');
+    if (!grezza) continue;
+    const rel = grezza.startsWith('"') && grezza.endsWith('"')
+      ? grezza.slice(1, -1).replace(/\\(.)/g, '$1')
+      : grezza;
+    const abs = perRel.get(rel);
+    if (abs) set.add(abs);
+  }
+  return { conosciuto: true, set };
+}
+
+/**
+ * Proof `rigenerabile`: a command in this repository still rebuilds this file.
+ *
+ * This is the second of the two things that authorise, and the one the first real
+ * run proved was missing: with only `gemello` the skill stops at the twins, and a
+ * file with no twin is exactly what a build artefact usually is.
+ *
+ * Three facts, and the third is what keeps it a proof rather than a guess:
+ *   1. the file is inside a directory this skill DECLARES as build output;
+ *   2. the repository itself declares that path generated (`git check-ignore`);
+ *   3. the command that rebuilds it exists, as a script, in that `package.json`
+ *      — and the contract entry carries the date of a hand-run clean-and-rebuild.
+ *
+ * What it is NOT: a pattern. A git-ignored file that is not inside a declared
+ * output directory — a `.log`, a `.env`, a `blog-preview` tree — is NOT proposed.
+ * Otherwise this is `fuori uso` under a new name, one level up: "ignored" is not
+ * "regenerable" exactly as "unreferenced" was not "derived", and the first real run
+ * of this skill already paid for that mistake once.
+ */
+function rigenerabile(p, ctx) {
+  if (!ctx.ignoreConosciuto) {
+    return { prova: null, perche: 'NON SO se il repository lo dichiara generato: nessuna radice ha risposto, e una scansione non conclusa non e\' un permesso' };
+  }
+  const gruppo = ctx.uscite.find((u) => {
+    const base = normalizza(u.radice + '/' + u.dir);
+    return normalizza(p).startsWith(base + '/');
+  });
+  if (!gruppo) {
+    return { prova: null, perche: 'nessun comando dichiarato produce la directory in cui sta' };
+  }
+  if (!ctx.ignorati.has(p)) {
+    return { prova: null, perche: 'il repository NON lo dichiara generato, e un file che git traccia e\' contenuto' };
+  }
+  return {
+    prova: 'rigenerabile',
+    perche: 'lo produce `npm run ' + gruppo.script + '` (' + gruppo.perche + ') e il repository lo dichiara generato; verificato a mano il ' + gruppo.verificatoIl.split(' — ')[0],
+    gruppo: gruppo.dir,
+    comando: 'npm run ' + gruppo.script
+  };
+}
+
 // ══ LE PROVE. Tre, e in tutte e tre la risposta è secca. ══
+
 //
 // «Una prova che richiede giudizio non è una prova: e se per decidere serve
 // pensare, allora in un comando schedulato non nessuno pensa, e il comando
@@ -92,6 +260,18 @@ const MAI_PER_TASTO = [
 /** sha256 of a file, or null when it cannot be read. */
 function sha256(p) {
   try { return createHash('sha256').update(readFileSync(p)).digest('hex'); } catch { return null; }
+}
+
+/**
+ * One spelling for a path, used for every COMPARISON and never for touching disk.
+ *
+ * On this machine the same place arrives spelled three ways — a constant in this
+ * file has forward slashes, `path.join` produces backslashes, and `.gitignore` uses
+ * forward slashes — and a comparison that mixes two of them is a comparison that
+ * does not match. That is not hypothetical: see the note at step 1b.
+ */
+function normalizza(p) {
+  return String(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
 /** Is this file inside a directory that holds derived copies? */
@@ -227,6 +407,12 @@ export function costruisciPiano(opts = {}) {
     motivoLedger: carte.motivo,
     dichiarati: opts.dichiarati || percorsiDichiarati(carte.carte),
     nomiLetti: opts.nomiLetti || indiceNomiLetti(),
+    // The declared outputs, already checked against the package.json that has to
+    // still exist. An entry that fails the check is not in here, so a stale
+    // contract claims nothing rather than claiming something false.
+    uscite: opts.usciteValide || usciteValide(opts.uscite),
+    ignorati: new Set(),
+    ignoreConosciuto: false,
     hashPerSha: new Map(),     // sha -> [paths]
     file: [],
     protetti: []
@@ -241,6 +427,28 @@ export function costruisciPiano(opts = {}) {
       if (motivo) { ctx.protetti.push({ path: p, perche: motivo }); continue; }
       ctx.file.push({ path: p, bytes: st.size, inCopia: inCopyDir(p) });
     }
+  }
+
+  // 1b) ask the repositories, once per root, which of the candidates they declare
+  //     generated. This is the input the `rigenerabile` proof is made of, so it is
+  //     gathered for every candidate and not per candidate: one spawn per root.
+  //
+  //     BOTH SIDES NORMALISED, and the reason is the bug this replaced. `ROOTS` holds
+  //     `MUNDER` with FORWARD slashes; `walk()` hands back paths with BACKSLASHES.
+  //     So `p.startsWith(radice + '\\')` matched NOTHING on the real floor, no
+  //     candidate was ever asked about, and the whole proof reported zero — silently,
+  //     with the unit tests green, because a temp dir and its own children agree on
+  //     their separators and the two constants do not.
+  //     *È lo stesso difetto della 100, ripetuto un livello più su: una regola che
+  //     non aggancia i percorsi che riceve non è una regola, è un commento — e un
+  //     test costruito su una forma sola non la può vedere.*
+  for (const radice of roots) {
+    const base = normalizza(radice);
+    const qui = ctx.file.filter((f) => normalizza(f.path).startsWith(base + '/'));
+    if (!qui.length) continue;
+    const r = dichiaratiGeneratiDaGit(radice, qui.map((f) => f.path));
+    if (r.conosciuto) ctx.ignoreConosciuto = true;
+    for (const p of r.set) ctx.ignorati.add(p);
   }
 
   // 2) hash the candidates. This is the expensive step and it is honest about it:
@@ -281,12 +489,39 @@ export function costruisciPiano(opts = {}) {
     // cheerfully listed 4 219 files with `[null]` next to them — a plan that says
     // "propose everything, and here is no reason". *A guard on the wrong field is a
     // guard that is not there.*
-    if (prova && prova.prova) proposti.push({ ...f, prova: prova.prova, perche: prova.perche });
+    if (prova && prova.prova) {
+      proposti.push({
+        ...f,
+        prova: prova.prova,
+        perche: prova.perche,
+        // `gruppo` and `comando` travel with the entry, because the unit that is
+        // safe to remove for a build output is the DIRECTORY, not the file: the
+        // directory is atomic and its children are not. A manifest that lists 3 000
+        // files without saying they are one artifact tree has described the wrong
+        // unit, and the reader has to reassemble it by hand.
+        gruppo: prova.gruppo || null,
+        comando: prova.comando || null
+      });
+    }
   }
   proposti.sort((a, b) => b.bytes - a.bytes);
 
+  // The regenerable entries, GROUPED, so the manifest names the thing a person can
+  // actually decide about: «this whole tree, and here is the command that puts it
+  // back». Per-file proposals hide the fact that the 3 000 are one decision.
+  const perGruppo = new Map();
+  for (const p of proposti) {
+    if (p.prova !== 'rigenerabile' || !p.gruppo) continue;
+    const k = p.gruppo;
+    if (!perGruppo.has(k)) perGruppo.set(k, { gruppo: k, comando: p.comando, file: 0, bytes: 0 });
+    const g = perGruppo.get(k);
+    g.file++; g.bytes += p.bytes;
+  }
+  const rigenerabili = [...perGruppo.values()].sort((a, b) => b.bytes - a.bytes);
+
   const byteTrovati = ctx.file.reduce((s, f) => s + f.bytes, 0);
   const byteProposti = proposti.reduce((s, f) => s + f.bytes, 0);
+  const byteRigenerabili = rigenerabili.reduce((s, g) => s + g.bytes, 0);
   return {
     generatoIl: new Date().toISOString(),
     radici: roots,
@@ -294,16 +529,23 @@ export function costruisciPiano(opts = {}) {
       fileTrovati: ctx.file.length,
       fileProtetti: ctx.protetti.length,
       fileProposti: proposti.length,
-      byteTrovati,
+      filePropostiPerGemello: proposti.filter((p) => p.prova === 'gemello').length,
+      filePropostiPerRigenerabile: proposti.filter((p) => p.prova === 'rigenerabile').length,
+      // The number the card is really about: without a second authorising proof the
+      // skill stops at the twins, and this is how many bytes it could not explain.
       byteProposti,
+      byteRigenerabili,
+      byteTrovati,
       byteCancellati: 0
     },
     proposte: proposti,
+    rigenerabili,
     // The protected list goes in the manifest too: the next reader must be able
     // to see WHAT WAS SPARED, not only what was offered. A manifest that lists
     // only the victims is a manifest that cannot be argued with.
     protetti: ctx.protetti.map((p) => ({ path: p.path, perche: p.perche })),
-    regola: 'UN FILE CHE ESISTE IN UN POSTO SOLO NON È UN RESIDUO: È L\'UNICA COPIA.'
+    regola: 'UN FILE CHE ESISTE IN UN POSTO SOLO NON È UN RESIDUO: È L\'UNICA COPIA.',
+    regolaProva: 'ALLA PROVA PUÒ AUTORIZZARE; IL GIUDIZIO VA DALL\'UMANO.'
   };
 }
 
@@ -367,8 +609,21 @@ function dimostra(f, ctx, keeperPerSha) {
   // and then says only derived files may be deleted; those two sentences do not
   // agree, and the one that says «derivato» wins, because the other one would
   // delete the repository.*
+  // RIGENERABILE — the second of the two authorising proofs, and the one the first
+  // real run proved was missing. Its verdict is the opposite shape of `fuori uso`:
+  // `fuori uso` was true of everything and therefore worthless, and this one is
+  // narrow on purpose. It says YES only where a declared command rebuilds the file
+  // AND the repository itself says the path is generated, and it says NO — with the
+  // reason — everywhere else, which is what makes it a proof that can fail.
+  const rig = rigenerabile(f.path, ctx);
+  if (rig.prova) return rig;
+
   const nota = fuoriUso(f.path, ctx);
-  return { prova: null, perche: 'fuori uso NON prova niente: ' + nota.perche };
+  return {
+    prova: null,
+    perche: 'fuori uso NON prova niente: ' + nota.perche
+      + (rig.perche ? '  [rigenerabile: ' + rig.perche + ']' : '')
+  };
 }
 
 function percorsoManifesto() {
@@ -384,9 +639,19 @@ function stampa(piano, cancellati) {
   console.log('  file trovati   : ' + c.fileTrovati);
   console.log('  file protetti  : ' + c.fileProtetti);
   console.log('  file proposti  : ' + c.fileProposti);
+  if (c.filePropostiPerGemello !== undefined) {
+    console.log('      per gemello       : ' + c.filePropostiPerGemello);
+    console.log('      per rigenerabile  : ' + c.filePropostiPerRigenerabile);
+  }
   console.log('  byte trovati   : ' + c.byteTrovati);
   console.log('  byte proposti  : ' + c.byteProposti);
   console.log('  byte cancellati: ' + (cancellati === undefined ? 0 : cancellati));
+  if (piano.rigenerabili && piano.rigenerabili.length) {
+    console.log('\n  rigenerabili, per directory (l\'unita\' che si decide e\' l\'albero, non il file):');
+    for (const g of piano.rigenerabili) {
+      console.log('    ' + g.gruppo + '/  ' + g.file + ' file  ' + g.bytes + ' B  ⟵ ' + g.comando);
+    }
+  }
   if (piano.proposte.length) {
     console.log('\n  proposte (percorso | byte | prova | perche):');
     for (const p of piano.proposte.slice(0, 40)) {
@@ -396,6 +661,7 @@ function stampa(piano, cancellati) {
     if (piano.proposte.length > 40) console.log('    ... e altre ' + (piano.proposte.length - 40));
   }
   console.log('\n  regola: ' + piano.regola);
+  if (piano.regolaProva) console.log('  regola: ' + piano.regolaProva);
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
@@ -438,6 +704,21 @@ function main(argv) {
 
   let cancellati = 0, saltati = 0, byteCancellati = 0;
   const registro = [];
+  // A `rigenerabile` proposal rests on the repository declaring the path generated.
+  // Between the plan and the press that can change — somebody un-ignores a path,
+  // or `git check-ignore` starts answering differently — and that is exactly the
+  // window in which the reason for the proposal disappears while the entry stays.
+  // So the reason is re-checked, in one batch, and anything that no longer holds is
+  // skipped rather than deleted.
+  const rigDaRivedere = m.proposte.filter((p) => p.prova === 'rigenerabile' && p.sha).map((p) => p.path);
+  const ancoraIgnorati = new Set();
+  for (const radice of m.radici || []) {
+    const base = normalizza(radice);
+    const qui = rigDaRivedere.filter((p) => normalizza(p).startsWith(base + '/'));
+    if (!qui.length) continue;
+    const r = dichiaratiGeneratiDaGit(radice, qui);
+    for (const p of r.set) ancoraIgnorati.add(p);
+  }
   for (const p of m.proposte) {
     // Re-verify BOTH that it is still what the manifest said, and that it is still
     // protected-free. A path can have become something else between the plan and
@@ -445,6 +726,11 @@ function main(argv) {
     let st; try { st = statSync(p.path); } catch { saltati++; registro.push({ path: p.path, esito: 'non esiste piu\'' }); continue; }
     const h = sha256(p.path);
     if (p.sha && h !== p.sha) { saltati++; registro.push({ path: p.path, esito: 'contenuto cambiato: non e\' piu\' quello approvato' }); continue; }
+    if (p.prova === 'rigenerabile' && !ancoraIgnorati.has(p.path)) {
+      saltati++;
+      registro.push({ path: p.path, esito: 'il repository non lo dichiara piu\' generato: la prova non regge piu\'' });
+      continue;
+    }
     if (percheProtetto(p.path, { dichiarati: new Set() })) { saltati++; registro.push({ path: p.path, esito: 'ora e\' protetto' }); continue; }
     try { unlinkSync(p.path); cancellati++; byteCancellati += st.size; registro.push({ path: p.path, esito: 'cancellato', bytes: st.size }); }
     catch (e) { saltati++; registro.push({ path: p.path, esito: 'cancellamento fallito: ' + e.code }); }
