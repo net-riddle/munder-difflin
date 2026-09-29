@@ -1,0 +1,32 @@
+# Line endings: LF in the index, on every platform.
+#
+# This file TRANSCRIBES a convention the repository already had, rather than
+# choosing one. Measured with `git ls-files --eol` before this file existed:
+#
+#   1031  i/lf     text files already stored with LF
+#     10  i/crlf   text files stored with CRLF, all of them under docs/hires/
+#    871  i/-text  detected as binary, untouched by text=auto
+#      5  i/none   no content at all
+#
+# So the convention was decided 1031 times and written down nowhere. That is the
+# situation this file ends: the repository's own answer, written in the place
+# git reads it, instead of inferred from 1031 blobs.
+#
+# WHY `eol=lf` AND NOT JUST `text=auto`
+#
+# `text=auto` alone normalises the INDEX and then lets core.autocrlf decide the
+# working tree. This repo sets core.autocrlf=true, so the working tree would keep
+# coming back CRLF and the two would differ by one byte per line. `eol=lf` pins
+# the working tree too, which is what makes a clone on any machine produce the
+# same bytes. That is the whole cost: a Windows working tree stops having CRLF, so
+# a local diff of a file you just edited shows only your line. Paid once, instead
+# of every consumer of these files paying it forever.
+#
+# `text=auto` is kept because the 871 binary files must stay binary: without it
+# git would be free to apply line-ending rules to a PNG.
+#
+# `docs/hires/` is a hand-written static site ("no build step, no framework"), not
+# a vendored bundle, so it is NOT exempt: its 10 CRLF files were the exception
+# without a reason, and this file is where the absence of a reason stops being
+# mistaken for one.
+* text=auto eol=lf
