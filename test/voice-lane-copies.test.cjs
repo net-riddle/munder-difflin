@@ -50,7 +50,23 @@ const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'out', 'coverage', 't
 const MAX_DEPTH = 12;
 
 const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
-const sha256 = (f) => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
+/**
+ * Hash the CONTENT, not the bytes on disk.
+ *
+ * This test reads two copies of the same document from two checkouts of the
+ * same repository, and hashed them raw: the repo's own file and an agent's copy
+ * are byte-identical under a CRLF checkout and differ by one byte per line
+ * under an LF one. So on a fresh Linux clone it reported two stale SKILL.md
+ * files whose text is identical to the repository's — a red about a divergence
+ * that does not exist, in a test whose whole job is to report real divergence.
+ *
+ * git stores LF and this repo sets core.autocrlf, so which bytes you get is a
+ * property of the machine, not of the document. Normalising is the same reason
+ * the other line-ending fixes normalise: the claim is about the text.
+ */
+const sha256 = (f) => crypto.createHash('sha256')
+  .update(fs.readFileSync(f, 'utf8').replace(/\r\n/g, '\n'))
+  .digest('hex');
 
 /** Where the agents' trees are, or null on a machine that has none. */
 function findLaneRoot() {
