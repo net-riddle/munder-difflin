@@ -41,24 +41,58 @@ test('a value outside the vocabulary is dropped, never repaired into one', () =>
   assert.equal(cap.isCapability('voice-sender'), true);
 });
 
-test('the two spellings of one job are ONE designation, decided by the system', () => {
-  // "Developer" and "developer" were both live on this floor, which is why "all
-  // the developers" could not be asked at all. Capabilities are derived from
-  // facts the system owns, so a person cannot split one job into two.
-  const jim = cap.deriveCapabilities({ cwd: 'F:\\workspace\\projects\\rush-breaker' });
-  const pam = cap.deriveCapabilities({ cwd: 'F:\\workspace\\projects\\cacioverse' });
-  assert.deepEqual(jim, ['rush-breaker']);
-  assert.deepEqual(pam, ['cacioverse']);
-  // Same folder, spelled two ways -> same designation. The case bug that made
-  // role unqueryable cannot happen here.
-  assert.deepEqual(jim, cap.deriveCapabilities({ cwd: 'f:/workspace/projects/RUSH-BREAKER' }));
+test('a birth directory does NOT designate a job, and the counterexample is on this floor', () => {
+  // god, task-jim-091: the table matched `cwd` substrings, so the field that
+  // answers "who should be doing this" was answering "who was started here".
+  // jim-mugp1eoh is not a synthetic fixture: his cwd IS
+  // F:/workspace/projects/rush-breaker and his write lane is munder-difflin +
+  // hive, so the old table designated the one agent on the floor whose lane is
+  // NOT rush-breaker as the rush-breaker agent.
+  //
+  // A directory is not a function — the reason this module already gave for
+  // `voice-sender`, applied to the other three instead of only to that one.
+  const myCwd = 'F:\\workspace\\projects\\rush-breaker';
+  assert.deepEqual(cap.deriveCapabilities({ cwd: myCwd }), [],
+    'the cwd that used to designate rush-breaker must now designate nothing');
+  // It is not enough that the answer is right: the same lane must not be
+  // reachable through any spelling of the path either.
+  assert.deepEqual(cap.deriveCapabilities({ cwd: 'f:/workspace/projects/RUSH-BREAKER' }), []);
+  assert.deepEqual(cap.deriveCapabilities({ cwd: 'F:\\workspace\\projects\\cacioverse' }), [],
+    'cacioverse was derived the same way, and it is wrong for Pam too — her lane is two directories');
+  assert.deepEqual(cap.deriveCapabilities({ cwd: 'F:\\workspace\\projects\\munder-difflin' }), [],
+    'and office-dev: the office directory is where Jim and Kelly were born, not a job');
 });
 
-test('the system assigns from isGod and cwd, and never from prose', () => {
+test('the system assigns from isGod, and never from prose', () => {
   assert.deepEqual(cap.deriveCapabilities({ isGod: true }), ['orchestrator']);
+  // An agent with no facts is not designated for anything. "Nobody" is an answer
+  // this module already makes deliberately, for `voice-sender`.
+  assert.deepEqual(cap.deriveCapabilities({}), []);
   // And a role in any language cannot leak in, because the signature has no slot
   // for it. `role` is for people; nothing automatic reads it.
   assert.equal(cap.deriveCapabilities.length, 1);
+});
+
+test('every lane capability is declared not-derivable, each with its own counterexample', () => {
+  // Silence would pass the closure test below and teach nothing, so this pins
+  // the part that carries the information: the three reasons are not one reason
+  // written three times. Each one names the agent it used to get wrong, and all
+  // three agents are named in hive/lanes.mjs with a DIFFERENT lane.
+  const reasonFor = (c) => {
+    const d = cap.NOT_DERIVABLE.find((x) => x.capability === c);
+    assert.ok(d, `${c} must be declared not-derivable, not silently absent`);
+    return d.because;
+  };
+  assert.match(reasonFor('rush-breaker'), /jim-mugp1eoh/,
+    'the rush-breaker reason is its counterexample: cwd is the office lane');
+  assert.match(reasonFor('office-dev'), /kelly-multwfg2/,
+    'the office-dev reason is its counterexample: the office dir is the voice lane');
+  assert.match(reasonFor('cacioverse'), /pam-mul0lzyj/,
+    'the cacioverse reason is its counterexample: a lane can be two directories');
+  for (const c of ['office-dev', 'rush-breaker', 'cacioverse']) {
+    assert.match(reasonFor(c), /hive\/lanes\.mjs/,
+      `${c} must say WHERE the declaration lives, so the next reader knows where to fix it`);
+  }
 });
 
 test('"who should send the voice messages" answers ONE id, and it is the live one', () => {
@@ -116,31 +150,39 @@ test('an unknown capability is answered as unknown, not as nobody-is-free', () =
   assert.equal(cap.whoShouldDo(KELLY_TONIGHT, 'cacioverse', { agentFolderExists: onDisk('kelly-multwfg2') }).unknownCapability, false);
 });
 
-test('the office lane derives: munder-difflin IS the office, so office-dev is not a judgement call', () => {
-  // god, 2026-09-29: the field that answers "who should" was built on a table
-  // that did not cover the office, and a hole in the table is a hole in the
-  // answer. The office is munder-difflin, so the office lane is derivable from
-  // cwd and was never an invention.
-  assert.deepEqual(
-    cap.deriveCapabilities({ cwd: 'F:\\workspace\\projects\\munder-difflin' }),
-    ['office-dev']);
-  assert.deepEqual(
-    cap.deriveCapabilities({ cwd: 'f:/workspace/projects/MUNDER-DIFFLIN' }),
-    ['office-dev'], 'the lane does not care how the path is spelled');
+test('the office lane is declared, not derived: munder-difflin is a place, not a job', () => {
+  // The same table had the bug in every row. `munder-difflin` designated
+  // kelly-multwfg2 — whose lane is munder-difflin but whose work is the voice —
+  // and god. The comment this test used to carry said "munder-difflin IS the
+  // office, so office-dev is not a judgement call": true about the DIRECTORY,
+  // and irrelevant, because the question is about a PERSON. A directory
+  // designates whoever was started in it, which on this floor is the office
+  // developer AND the voice sender AND the orchestrator.
+  assert.deepEqual(cap.deriveCapabilities({ cwd: 'F:\\workspace\\projects\\munder-difflin' }), []);
+  assert.deepEqual(cap.deriveCapabilities({ cwd: 'f:/workspace/projects/MUNDER-DIFFLIN' }), [],
+    'the lane does not care how the path is spelled — it is not read at all');
 });
 
 test('a hole in the derivation table is impossible to leave quietly', () => {
   // The general form of the bug above: every capability must either come out of
   // some derivation, or be named in NOT_DERIVABLE with a reason. A capability
   // that is neither is a question with no answer and nobody holding it.
+  //
+  // The sample inputs are DELIBERATELY the ones the old table used to derive
+  // from, and they now produce nothing: so this test is also a regression on
+  // that table coming back, and the four other capabilities can only be covered
+  // by a declared reason. Before this change the same test passed for the
+  // opposite reason, which is what made the defect quiet.
   const lanes = [
     { isGod: true },                                            // orchestrator
-    { cwd: 'F:\\workspace\\projects\\munder-difflin' },          // office-dev
-    { cwd: 'F:\\workspace\\projects\\cacioverse' },              // cacioverse
-    { cwd: 'F:\\workspace\\projects\\rush-breaker' }             // rush-breaker
+    { cwd: 'F:\\workspace\\projects\\munder-difflin' },          // used to be office-dev
+    { cwd: 'F:\\workspace\\projects\\cacioverse' },              // used to be cacioverse
+    { cwd: 'F:\\workspace\\projects\\rush-breaker' }             // used to be rush-breaker
   ];
   const derivable = new Set(lanes.flatMap((m) => cap.deriveCapabilities(m)));
   const declared = new Set(cap.NOT_DERIVABLE.map((d) => d.capability));
+  assert.deepEqual([...derivable], ['orchestrator'],
+    'only isGod designates anything; a directory designates nobody');
   for (const c of cap.CAPABILITIES) {
     const covered = derivable.has(c) || declared.has(c);
     assert.ok(covered,

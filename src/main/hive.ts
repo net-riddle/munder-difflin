@@ -692,12 +692,20 @@ export class HiveManager {
     reg.agents[meta.id] = {
       ...prev,
       ...meta,
-      // Derived by the SYSTEM from isGod + cwd, then filtered through the closed
-      // vocabulary — never taken from prose. This is the whole point: a
-      // machine-read field that a person can also type inherits every typo they
-      // ever made, which is exactly how `role` became unqueryable ("Developer"
-      // and "developer" both live on this floor). See src/main/capabilities.ts.
-      capabilities: deriveCapabilities({ isGod: meta.isGod, cwd: meta.cwd }),
+      // The SYSTEM derives this, never from prose and never from a directory.
+      // It used to match `cwd` substrings, so the agent was designated by where
+      // it was BORN: on this floor jim-mugp1eoh (cwd rush-breaker, write lane
+      // munder-difflin + hive) was registered as the rush-breaker agent, and all
+      // three derivable designations were wrong. What the system can honestly
+      // know is `orchestrator` from isGod; the rest is declared policy, declared
+      // in hive/lanes.mjs, which this repo cannot import across its own border.
+      // See src/main/capabilities.ts and task-jim-091.
+      //
+      // KNOWN LIMIT, measured, not fixed here: this line recomputes the field on
+      // every spawn, so a value written into registry.json by hand does not
+      // survive. That is why nothing may be declared here yet, and why the
+      // declaration channel is a decision for god, not a line to invent here.
+      capabilities: deriveCapabilities({ isGod: meta.isGod }),
       role,
       status: 'idle',
       cwdValid: cwd.valid,

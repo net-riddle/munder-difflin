@@ -89,29 +89,38 @@ export function normalizeCapabilities(values: unknown): {
  *
  * The point of deriving rather than accepting: `role` is unreliable precisely
  * because a person types it, and a machine-read field that a person can also
- * type inherits every typo they ever made. Every token here comes from either
- * `isGod` (set by the harness) or `cwd` (validated at spawn), never from prose.
+ * type inherits every typo they ever made. Every token here comes from `isGod`
+ * (set by the harness) — never from prose, and never from a directory.
  *
- * `office-dev` is deliberately NOT derived: no existing fact says who is an
- * office developer, and guessing it would be inventing a designation — the one
- * thing this whole field exists to prevent.
+ * WHY THERE IS NO `cwd` SLOT ANY MORE (2026-09-29, task-jim-091)
+ *
+ * This used to read `cwd` and match substrings: `/munder-difflin` -> office-dev,
+ * `/rush-breaker` -> rush-breaker, `/cacioverse` -> cacioverse. It was wrong for
+ * a reason this module had already written down for `voice-sender` and then not
+ * applied to itself: **a directory is not a function.** `cwd` is where an agent
+ * was BORN, and the harness may start a worker anywhere; it says nothing about
+ * where that agent is allowed to write.
+ *
+ * The live floor proved it with no hypothetical needed. `jim-mugp1eoh` has
+ * `cwd = F:/workspace/projects/rush-breaker` and a write lane of munder-difflin
+ * + hive, so the old table designated the one agent here whose lane is NOT
+ * rush-breaker as the rush-breaker agent. `kelly-multwfg2` got `office-dev` from
+ * `munder-difflin` while her `voice-sender` designation was never written at all.
+ * That is the field that answers "who should be doing this" answering with "who
+ * was started here" — and all three derivable designations on the floor were
+ * wrong, not one.
+ *
+ * The parameter is GONE from the type rather than ignored, so a caller that
+ * passes an object literal with `cwd` gets an excess-property error instead of a
+ * silent designation. That is a tripwire, not a fence: a caller that spreads a
+ * pre-built object is not caught by the compiler, which is why the tests, not
+ * the type, are what hold this in place.
  */
 export function deriveCapabilities(meta: {
   isGod?: boolean;
-  cwd?: string;
 }): Capability[] {
   const out: Capability[] = [];
   if (meta.isGod) out.push('orchestrator');
-  const cwd = (meta.cwd ?? '').replace(/\\/g, '/').toLowerCase();
-  if (cwd) {
-    // The office IS munder-difflin, so the office lane derives from it. This
-    // hole was pointed out on 2026-09-29: the field that answers "who should"
-    // was built on a table that did not cover the office, and a hole in the
-    // table is a hole in the answer.
-    if (cwd.includes('/munder-difflin')) out.push('office-dev');
-    if (cwd.includes('/rush-breaker')) out.push('rush-breaker');
-    if (cwd.includes('/cacioverse')) out.push('cacioverse');
-  }
   return out;
 }
 
@@ -138,6 +147,21 @@ export const NOT_DERIVABLE: ReadonlyArray<{
     capability: 'voice-sender',
     because:
       'two agents share cwd munder-difflin and only one sends voice messages, so a directory cannot designate a function. Needs a fact the system does not have yet.'
+  },
+  {
+    capability: 'office-dev',
+    because:
+      'was derived from cwd, which named the office directory rather than a person: it designated kelly-multwfg2, whose lane is munder-difflin but whose work is the voice. The lane is declared once, in hive/lanes.mjs, and this module cannot import across the repository boundary; a copy of that table here would be the second source of truth task-jim-091 exists to remove.'
+  },
+  {
+    capability: 'rush-breaker',
+    because:
+      'was derived from cwd, and jim-mugp1eoh is the counterexample: cwd rush-breaker, write lane munder-difflin + hive. A birth directory is not a lane, so the old table designated the one agent whose lane is NOT rush-breaker. Same reason as office-dev: the declared lane lives in hive/lanes.mjs.'
+  },
+  {
+    capability: 'cacioverse',
+    because:
+      'was derived from cwd, and cwd is a single directory while a lane can be more than one: pam-mul0lzyj was given cacioverse and lost the rush-breaker half of her lane, so the answer was not merely wrong but incomplete. Same reason as office-dev: the declared lane lives in hive/lanes.mjs.'
   }
 ];
 
