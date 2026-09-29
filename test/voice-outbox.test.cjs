@@ -1024,16 +1024,32 @@ function raceFixture(id) {
   writeFileSync(join(dir, name), JSON.stringify({ v: 1, id: `msg-${id}`, text: 'Una frase che l\'umano sentira.', createdAt: 'now' }), 'utf8');
   return {
     dir, name,
-    // `withReceipt` is the whole experiment: true = the other drainer finished
-    // the job properly, false = it took the envelope and left nothing behind.
-    otherDrainer: (withReceipt) => async () => {
-      renameSync(join(dir, name), join(dir, '.done', name));
+    // 093: THE RACE MOVED, so the fixture moved with it — and that is the whole
+    // reason these three tests had to be re-pinned rather than left alone.
+    //
+    // They used to intercept `playImpl`: the other drainer moved the envelope
+    // while THIS process was still producing audio. That modelled a race decided
+    // AFTER both had spoken — true then, and no longer where the decision is. The
+    // claim now takes the envelope out of the queue with a rename BEFORE the first
+    // piece, so the loser finds out having spoken NOTHING, and a lock placed after
+    // the audio could never have prevented it.
+    //
+    // So the race is staged BEFORE `flushOne`, and `withReceipt` keeps its
+    // meaning: true = the other drainer left a receipt beside it (mid-speak in
+    // `.claim/`, or finished in `.done/`), false = it took the envelope and left
+    // nothing at all.
+    raced: (withReceipt, where) => {
+      const dest = where === 'claim' ? join(dir, '.claim') : join(dir, '.done');
+      mkdirSync(dest, { recursive: true });
+      renameSync(join(dir, name), join(dest, name));
       if (withReceipt) {
-        writeFileSync(join(dir, '.done', mod.receiptName(name)),
-          JSON.stringify({ outcome: 'played', chars: 33, pieceCount: 1, spokenCount: 1 }), 'utf8');
+        writeFileSync(join(dest, mod.receiptName(name)),
+          JSON.stringify({ outcome: 'claimed', chars: 33, pieceCount: 1, spokenCount: 1 }), 'utf8');
       }
-      return { ok: true };
+      return dest;
     },
+    claimReceipt: () => join(dir, '.claim', mod.receiptName(name)),
+    inClaim: () => existsSync(join(dir, '.claim', name)),
     doneReceipt: () => join(dir, '.done', mod.receiptName(name)),
     hasReceipt: () => existsSync(join(dir, '.done', mod.receiptName(name))),
     hasEnvelope: () => existsSync(join(dir, name)),
@@ -1043,8 +1059,10 @@ function raceFixture(id) {
 
 test('083: ENOENT on the rename is SUCCESS when the other drainer left a receipt', async () => {
   const f = raceFixture('raced');
+  f.raced(true, 'done');
   const r = await mod.flushOne(f.dir, f.name, {
-    userData: f.dir, platform: 'win32', playImpl: f.otherDrainer(true),
+    userData: f.dir, platform: 'win32',
+    playImpl: async () => { throw new Error('the loser must not reach the speaker'); },
     fetchImpl: async () => new Response(realWav(), { status: 200 }), budgetMs: 5000
   });
 
@@ -1063,15 +1081,36 @@ test('083: ENOENT on the rename is SUCCESS when the other drainer left a receipt
   assert.match(line.text, /app watcher filed it first/, 'and the race is visible, not silent');
 });
 
-test('083: ENOENT on the rename with NO receipt is still a loss, and stays red', async () => {
+test('083: the other drainer HOLDS the claim and is still only a loss if nothing is written', async () => {
+  // The case that only exists in the new position: the other drainer won the
+  // claim and is mid-speak, so the envelope is in `.claim/` with a claim receipt
+  // and no `.done` receipt yet. This process must treat that as success, because
+  // the receipt beside it is the evidence that somebody is speaking it.
+  const f = raceFixture('midclaim');
+  f.raced(true, 'claim');
+  const r = await mod.flushOne(f.dir, f.name, {
+    userData: f.dir, platform: 'win32',
+    playImpl: async () => { throw new Error('the loser must not reach the speaker'); },
+    fetchImpl: async () => new Response(realWav(), { status: 200 }), budgetMs: 5000
+  });
+  assert.equal(r.ok, true, 'a claim somebody else holds is a success, not a loss');
+  assert.equal(r.receipt.racedBy, 'other-drainer');
+  assert.equal(r.receipt.atStage, 'claim', 'and it says WHERE it found out: the claim, not the exit');
+  assert.equal(f.inClaim(), true, 'the premise: the envelope really is in .claim, held');
+  assert.ok(fs.existsSync(f.claimReceipt()), 'with a receipt beside it — the file is the evidence, not the word');
+});
+
+test('083: an envelope that vanished with no receipt must throw, not report success', async () => {
   // THE CASE THAT MUST NOT BE PAPERED OVER. Identical from this side — the
   // envelope is gone — but now nothing proves it was ever spoken. A guard that
   // treated both as success would announce a delivery nobody can verify, which
   // is the same class of lie in the opposite direction.
   const f = raceFixture('lost');
+  f.raced(false, 'done');
   await assert.rejects(
     () => mod.flushOne(f.dir, f.name, {
-      userData: f.dir, platform: 'win32', playImpl: f.otherDrainer(false),
+      userData: f.dir, platform: 'win32',
+      playImpl: async () => { throw new Error('a vanished envelope must never reach the speaker'); },
       fetchImpl: async () => new Response(realWav(), { status: 200 }), budgetMs: 5000
     }),
     (e) => e.code === 'ENOENT',
@@ -1086,15 +1125,19 @@ test('083: the guard is the RECEIPT, not the error code — same ENOENT, both wa
   // verdicts, decided by one file on disk. If someone ever "simplifies" the
   // check into catching ENOENT outright, this is what notices.
   const raced = raceFixture('pair-a');
+  raced.raced(true, 'done');
   const ok = await mod.flushOne(raced.dir, raced.name, {
-    userData: raced.dir, platform: 'win32', playImpl: raced.otherDrainer(true),
+    userData: raced.dir, platform: 'win32',
+    playImpl: async () => { throw new Error('the loser must not reach the speaker'); },
     fetchImpl: async () => new Response(realWav(), { status: 200 }), budgetMs: 5000
   });
   const lost = raceFixture('pair-b');
+  lost.raced(false, 'done');
   let threw = false;
   try {
     await mod.flushOne(lost.dir, lost.name, {
-      userData: lost.dir, platform: 'win32', playImpl: lost.otherDrainer(false),
+      userData: lost.dir, platform: 'win32',
+      playImpl: async () => { throw new Error('a vanished envelope must never reach the speaker'); },
       fetchImpl: async () => new Response(realWav(), { status: 200 }), budgetMs: 5000
     });
   } catch { threw = true; }
@@ -1242,13 +1285,35 @@ test('086: flushOne does not SPEAK an id — it files it, and says why', async (
 
 const TEMP_ARTEFACTS = ['ps1', 'tmp', 'wav'];
 
+// 093: two things that are not envelopes, DECLARED BY NAME and with the reason, so
+// the exception is a list a reader can check instead of a pattern that quietly
+// widens until it means the opposite of the invariant.
+//
+//   - `rmdirSync` removes a DIRECTORY. An envelope is a file, so this call cannot
+//     eat one whatever it is pointed at.
+//   - `claimReceiptPath` is built from `receiptName`, so its result ends in
+//     `.receipt.json`. A receipt is the PROOF of a delivery that already
+//     happened, not the thing that was promised to the human: deleting one
+//     removes no message from anyone. The 088 invariant is "MOVES, not deletes"
+//     and it is about ENVELOPES — a claim receipt is not one.
+//
+// The mutation below still has to bite on a real envelope, and the test now also
+// checks the exemptions themselves: a declared exemption nothing verifies is a
+// hole with a comment on it, which is the shape I have been removing all night.
+const NOT_ENVELOPES = [/claimReceiptPath/, /receiptName/];
+const NOT_A_FILE_AT_ALL = new Set(['rmdirSync']);
+
 function envelopeDeleters(source) {
   // Every call that removes a file, and whether its argument names one of the
   // three throwaway artefacts the lane is allowed to clean up.
   const out = [];
   for (const m of String(source).matchAll(/\b(unlinkSync|rmSync|rmdirSync)\s*\(\s*([^,)]+)/g)) {
+    const fn = m[1];
     const arg = m[2];
-    if (!TEMP_ARTEFACTS.some((a) => arg.includes(a))) out.push({ fn: m[1], arg: arg.trim() });
+    if (NOT_A_FILE_AT_ALL.has(fn)) continue;
+    if (TEMP_ARTEFACTS.some((a) => arg.includes(a))) continue;
+    if (NOT_ENVELOPES.some((re) => re.test(arg))) continue;
+    out.push({ fn, arg: arg.trim() });
   }
   return out;
 }
@@ -1273,6 +1338,16 @@ test('088: the lane never deletes an envelope, and the guard PROVES it can tell'
   // The other direction: the temp files it DOES clean up must stay legal, or the
   // guard would push the next person towards never unlinking anything.
   assert.deepEqual(envelopeDeleters('unlinkSync(ps1); unlinkSync(tmp); unlinkSync(wav);'), []);
+
+  // 093: THE EXEMPTIONS ARE THEMSELVES TESTED, not assumed. An exemption nobody
+  // checks is a hole with a comment on it, and that is the same shape as the
+  // defect this guard exists for.
+  assert.deepEqual(envelopeDeleters('unlinkSync(claimReceiptPath(outbox, name));'), [],
+    'a receipt is not an envelope: deleting one takes the message away from nobody');
+  assert.deepEqual(envelopeDeleters('rmdirSync(claimDir);'), [],
+    'and a directory is not a file, so it cannot be an envelope');
+  assert.equal(envelopeDeleters('unlinkSync(claimed);').length, 1,
+    'BUT a bare envelope path is still caught: the exemption is named, not broad. This is the line that keeps it an exemption rather than a hole.');
 });
 
 // ─── 092: the trace's reach, which is `--write` and not the directory ─────────
@@ -1292,12 +1367,23 @@ function envelopePublishers(source) {
   // Every call that makes a file appear where a drainer will look for a message
   // to speak: a rename INTO a queue directory. `.tmp` sources are excluded
   // because the rename is what publishes, not the write that staged it.
+  const s = String(source);
   const out = [];
-  for (const m of String(source).matchAll(/\brenameSync\s*\(\s*[^,]+,\s*([^)]+)\)/g)) {
+  for (const m of s.matchAll(/\brenameSync\s*\(\s*[^,]+,\s*([^)]+)\)/g)) {
     const dest = m[1];
     // Into the queue root or into a state dir. Both are "the message is now
     // here, speak it"; only the first is a new message entering.
-    if (/join\(\s*(outbox|to)\b/.test(dest)) out.push({ dest: dest.trim() });
+    if (/join\(\s*(outbox|to)\b/.test(dest)) {
+      // 093: WHICH function publishes, by NAME. A count of 2 on its own tells a
+      // reader nothing — it does not say whether the second writer is a bug or a
+      // second way in that somebody declared. So the enclosing function travels
+      // with the call, and the failure message can name both: a second writer
+      // WITH A NAME is a widened invariant, a second writer that cannot be named
+      // is a hole.
+      const prima = s.slice(0, m.index);
+      const fn = [...prima.matchAll(/(?:export\s+)?(?:async\s+)?function\s+(\w+)/g)].pop();
+      out.push({ dest: dest.trim(), fn: fn ? fn[1] : '?' });
+    }
   }
   return out;
 }
@@ -1309,12 +1395,30 @@ test('092: exactly one thing can publish a message, and it writes the trace firs
   // One publisher into the queue ROOT (a new message), plus the one exit into
   // .done/.failed (a message that was already spoken). Anything else is a
   // second way in, and the subject of 4d17bd0a stops being true.
+  //
+  // 093: THERE ARE NOW TWO PUBLISHERS, AND BOTH ARE NAMED. `reclaim` is the
+  // declared second way in: it does not publish anything new, it returns a
+  // message that was ALREADY traced, and the id is the only thing the human
+  // sees — so routing it through `queueMessage` would change the very thing the
+  // invariant exists to protect. Option (b) was refused for exactly that reason.
+  const nomi = (ps) => ps.map((p) => p.fn).sort();
   const entering = publishers.filter((p) => /join\(\s*outbox\b/.test(p.dest));
   const exiting = publishers.filter((p) => /join\(\s*to\b/.test(p.dest));
-  assert.equal(entering.length, 1,
-    `exactly one publisher enters the queue, and it is queueMessage: ${JSON.stringify(publishers)}`);
+  assert.equal(entering.length, 2,
+    `two DECLARED publishers enter the queue — ${nomi(entering)} — ${JSON.stringify(entering)}`);
+  assert.deepEqual(nomi(entering), ['queueMessage', 'reclaim'],
+    'and they are the two the card named: the publisher, and the recovery that returns an already-traced message');
   assert.equal(exiting.length, 1,
     `and exactly one rename is the exit into .done/.failed: ${JSON.stringify(publishers)}`);
+
+  // THE INVARIANT IS ABOUT THE TRACE, NOT ABOUT THE COUNT OF WRITERS, so a second
+  // publisher is only legal while it cannot break it. This is the assertion that
+  // makes "declared" mean something: `reclaim` returns the SAME envelope and must
+  // not touch the trace it arrived with.
+  const reclaimAt = source.indexOf('export function reclaim');
+  assert.ok(reclaimAt > 0, 'reclaim is present, so the second publisher is a named function and not a stray rename');
+  assert.equal(/unlinkSync\([^)]*written[^)]*\)/.test(source.slice(reclaimAt, reclaimAt + 1400)), false,
+    'reclaim must not delete the .written/ trace: "in the queue => has a trace" is what the trace is FOR, and a recovery that removed it would make the second publisher a violation wearing a name');
 
   // Direction matters and is the reason the trace is written first: the trace
   // must appear in the source BEFORE the rename that publishes the envelope.
@@ -1339,16 +1443,16 @@ test('092: exactly one thing can publish a message, and it writes the trace firs
   );
   assert.notEqual(mutated, source, 'the mutation must actually apply, or the proof is theatre');
   const foundEntering = envelopePublishers(mutated).filter((p) => /join\(\s*outbox\b/.test(p.dest));
-  assert.equal(foundEntering.length, 2, JSON.stringify(foundEntering));
+  assert.equal(foundEntering.length, 3, JSON.stringify(foundEntering));
   assert.ok(foundEntering.some((p) => /name2/.test(p.dest)),
-    'and it names the second route that publishes without a trace');
+    'and it names the third route that publishes without a trace — a THIRD writer is still the defect, whatever its name');
 
   // The reverse direction: the exit must stay legal, or this guard would push
   // the next person towards never renaming anything. The captured destination
   // stops at the first `)` — that is what this parser does, asserted here
   // rather than left for the next reader to discover as a surprise.
-  assert.deepEqual(envelopePublishers('renameSync(tmp, join(outbox, name));'), [{ dest: 'join(outbox, name' }]);
-  assert.deepEqual(envelopePublishers('renameSync(tmp, join(to, name));'), [{ dest: 'join(to, name' }]);
+  assert.deepEqual(envelopePublishers('renameSync(tmp, join(outbox, name));'), [{ dest: 'join(outbox, name', fn: '?' }]);
+  assert.deepEqual(envelopePublishers('renameSync(tmp, join(to, name));'), [{ dest: 'join(to, name', fn: '?' }]);
 });
 
 // ─── 088 again: nothing enters the queue without leaving a trace ──────────────

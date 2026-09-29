@@ -50,7 +50,7 @@
  * and the one number that matters — when this was played — was on nobody's disk.
  */
 
-import { readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, existsSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, existsSync, unlinkSync, rmdirSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -940,6 +940,110 @@ export function writeReceipt(dir, name, receipt) {
   }
 }
 
+// ─── the claim: who owns the right to speak this envelope ─────────────────────
+
+/** Where an envelope lives while a drainer owns it. */
+export const CLAIM_DIR = '.claim';
+
+/**
+ * How long a claim may go un-renewed before another drainer may take it back.
+ *
+ * DERIVED, not chosen — and the derivation is written out so the next reader does
+ * not have to take the number on trust, or to guess at it again.
+ *
+ *   worst measured end-to-end (synthesis + playback): 25.1 s
+ *       Kelly, 2026-09-29 — XTTS, 101 chars, 1 piece (16.9 s synthesis + 8.2 s playback)
+ *       and 24 899 ms on Kokoro, 382 chars, 2 pieces (`msg-1790693102082-godkok02`)
+ *   measured playback rate: 61.6 ms/char on Kokoro, 81.2 ms/char on XTTS
+ *   one piece of the maximum 220 chars: ~19 s, worst case
+ *   declared margin: 2.2x  (god, 2026-09-29, `task-jim-093`)
+ *
+ *   25.1 s x 2.2 = 55.2 s
+ *
+ * WHY PER PIECE AND NOT PER MESSAGE. The ceiling is 2 000 characters
+ * (`validateEnvelope` rejects more) and a piece is 220, so a message can be ten
+ * pieces — about 124 s of playback on the measured rate. A 55.2 s window applied
+ * to a whole message would expire a LIVE claim halfway through a long message and
+ * let a second drainer begin speaking while this one is still speaking: that
+ * turns today's occasional double-send into a guaranteed one above ~900 chars.
+ * So the claim is renewed after every piece (`onPiece`) and this number only has
+ * to outlive ONE piece — which is what makes a message of any length covered.
+ *
+ * The 25.1 s is Kelly's, the product is Jim's, and the 2.2 is god's: the only
+ * degree of freedom in the chain is the margin, so it is named on the code.
+ */
+export const CLAIM_WINDOW_MS = 55_200;
+
+/** The claim receipt for `name` — the file that says "a drainer owns this". */
+export function claimReceiptPath(outbox, name) {
+  return join(outbox, CLAIM_DIR, receiptName(name));
+}
+
+/**
+ * Every claim that has gone un-renewed for longer than the window, oldest first.
+ *
+ * THIS IS THE READER `.claim/` NEEDS AND DID NOT HAVE, and it is not optional.
+ * `pending()` reads the input directory non-recursively and `isEnvelopeFile`
+ * rejects dot-names, so an envelope a dead drainer is holding is invisible to every
+ * reader that already exists: it does not vanish, it vanishes from view, which is
+ * a worse hole than the race this closes. So recovery is a SECOND READER, not a
+ * guard bolted onto the queue — otherwise a drainer dying mid-message loses the
+ * message with no trace, the one state this file exists to remove.
+ */
+export function expiredClaims(outbox, { now = Date.now, windowMs = CLAIM_WINDOW_MS } = {}) {
+  const dir = join(outbox, CLAIM_DIR);
+  let names;
+  try { names = readdirSync(dir); } catch { return []; }
+  const at = now();
+  const out = [];
+  for (const f of names) {
+    if (!f.endsWith(RECEIPT_SUFFIX)) continue;
+    let rec;
+    try { rec = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch { continue; }
+    const renewed = Date.parse(rec.renewedAt || rec.claimedAt || 0);
+    if (!Number.isFinite(renewed)) continue;
+    const name = f.slice(0, -RECEIPT_SUFFIX.length) + '.json';
+    if (!existsSync(join(dir, name))) continue;   // a receipt with no envelope: nothing to reclaim
+    if (at - renewed > windowMs) {
+      out.push({ name, renewedAt: rec.renewedAt || rec.claimedAt, waitedMs: at - renewed, owner: rec.claimedBy ?? null });
+    }
+  }
+  return out.sort((a, b) => a.waitedMs - b.waitedMs);
+}
+
+/**
+ * Take an expired claim back: the envelope returns to the INPUT directory and the
+ * claim receipt goes away, so `pending()` sees it again and this drainer speaks it
+ * in the same run.
+ *
+ * RE-DELIVERY, NOT `.failed`, and that is the decision. Filing it `.failed` would
+ * also give the envelope an outcome, so "never vanish without a trace" would hold
+ * either way — but a filed message is INVISIBLE: the human never learns there was
+ * one. A duplicate is visible, it is heard twice, and a human can report it. An
+ * honest error is learned and avoided; a silent disappearance is not learned at all.
+ *
+ * THE COST, DECLARED: if a drainer dies AFTER the last piece was audible and BEFORE
+ * the envelope was filed, this speaks the message a second time. That window is
+ * real and no measurement closes it. It is the direction this prefers to be wrong.
+ */
+export function reclaim(outbox, name, { now = () => new Date().toISOString() } = {}) {
+  const from = join(outbox, CLAIM_DIR, name);
+  try {
+    renameSync(from, join(outbox, name));
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    return { ok: false, name, error: 'nothing to reclaim: the envelope is not there' };
+  }
+  // ONE spelling of this path, like everywhere else in the file. Written inline it
+  // was `join(outbox, CLAIM_DIR, receiptName(name))` — same value, and the 088
+  // guard could not see it: that guard captures the argument up to the first comma,
+  // so it saw `join(outbox` and no receipt in it. Fixing the parser to be cleverer
+  // would have hidden the real thing, which is that the file had two ways to name
+  // the same file and only one of them said so. *A duplicate spelling is a copy of
+  // an idea, and the copy is the one that stops being true.*
+  try { unlinkSync(claimReceiptPath(outbox, name)); } catch { /* best effort */ }
+  return { ok: true, name, at: now() };
+}
 /**
  * Speak one envelope, moving it to `.done/` or `.failed/` afterwards.
  *
@@ -947,9 +1051,10 @@ export function writeReceipt(dir, name, receipt) {
  * that vanishes without a trace is a message the user was expecting and never
  * heard, with no evidence it ever existed.
  */
-export async function flushOne(outbox, name, { userData, fetchImpl, platform, clock = Date.now, playImpl, budgetMs } = {}) {
-  const src = join(outbox, name);
-  const startedAt = clock();
+export async function flushOne(outbox, name, { userData, fetchImpl, platform, clock = Date.now, playImpl, budgetMs, claimAsOf } = {}) {
+  const inboxPath = join(outbox, name);
+  let src = inboxPath;  const startedAt = clock();
+  const at = () => new Date(typeof claimAsOf === 'function' ? claimAsOf() : clock()).toISOString();
 
   /**
    * Move the envelope and leave a receipt beside it, then report the receipt's
@@ -994,17 +1099,106 @@ export async function flushOne(outbox, name, { userData, fetchImpl, platform, cl
     return written;
   };
 
+  // ─── the claim ────────────────────────────────────────────────────────────
+  // TAKES THE ENVELOPE OUT OF THE INPUT DIRECTORY BEFORE ANY AUDIO, and the
+  // rename is the mutex: two drainers, one winner, and the loser finds out here,
+  // while it has still spoken nothing. Before this the loser found out AFTER both
+  // had spoken, and merely declared it afterwards.
+  //
+  // The claim receipt is written before playback starts, and that is the part that
+  // makes the 14:47 impossible rather than merely guarded: from this instant every
+  // state the envelope can be in has an outcome-bearing file BESIDE it. The same
+  // primitive, in the same shape, as every other receipt — so the 089 guard needs
+  // no new case: "a receipt beside it" already means "someone owns this".
+  const claimDir = join(outbox, CLAIM_DIR);
+  const claimed = join(claimDir, name);
+  const clearClaim = () => {
+    // Delete the RECEIPT, never the envelope — that is the 088 invariant, and this is
+    // its exact opposite, written on purpose: an envelope is only ever RENAMED.
+    try { unlinkSync(claimReceiptPath(outbox, name)); } catch { /* best effort */ }
+    // And the directory goes only when it is EMPTY (rmdir throws ENOTEMPTY otherwise),
+    // so the queue looks exactly as it did before this change whenever nothing is
+    // claimed. A test that COUNTS the queue must not stop counting because a mechanism
+    // left a directory behind: the shape of una coda quando e' vuota e' un contratto.
+    try { rmdirSync(claimDir); } catch { /* qualcun altro ha ancora un possesso */ }
+  };
+  /** Put it back where the next drainer will find it. Used when nothing was spoken. */
+  const release = () => {
+    // `inboxPath`, NON `src`: dopo il claim `src` e' `claimed`, e rinominare un file
+    // su se' stesso riuscirebbe senza spostare niente — cioe' il ramo `queued`,
+    // l'unico in cui l'envelope deve TORNARE IN CODA, avrebbe finito per lasciarlo
+    // in `.claim/`. L'aveva scritto cosi' e un test di un altro worker l'ha preso.
+    try { renameSync(claimed, inboxPath); } catch { /* best effort */ }
+    clearClaim();
+  };
+  const lost = (path, why) => ({
+    ok: true, name, chars: 0, pieces: 0, spoken: 0, results: [],
+    startedAt: new Date(startedAt).toISOString(), totalMs: Math.max(0, clock() - startedAt),
+    synthMs: 0, playMs: 0, receipt: { ok: true, path, racedBy: 'other-drainer', atStage: why },
+  });
+  let claimedAt = at();
+  mkdirSync(claimDir, { recursive: true });
+  try {
+    renameSync(src, claimed);
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      const cr = claimReceiptPath(outbox, name);
+      if (existsSync(cr)) return lost(cr, 'claim');
+      for (const sub of ['.done', '.failed']) {
+        const filed = join(outbox, sub, receiptName(name));
+        if (existsSync(filed)) return lost(filed, sub);
+      }
+    }
+    throw e;
+  }
+  src = claimed;
+  const renew = () => {
+    const renewedAt = at();
+    return {
+      renewedAt,
+      w: writeReceipt(claimDir, name, {
+        outcome: 'claimed', claimedAt, renewedAt, chars: null, claimedBy: process.pid ?? null,
+      }),
+    };
+  };
+  // THE FIRST CLAIM RECEIPT IS NOT OPTIONAL, and that is a fact I only got by
+  // writing this: `expiredClaims` finds claims BY THEIR RECEIPT, so an envelope
+  // whose first receipt failed to write sits in `.claim/` with nothing pointing at
+  // it, and no reader on earth can ever get it back. That is the 14:47, reopened by
+  // the very mechanism meant to close it. So if the first write fails, the claim is
+  // RELEASED and the envelope goes back to the input directory: still queued, still
+  // visible, and the next drainer simply tries again. A later failure is not fatal —
+  // the previous receipt is still there with an older `renewedAt`, so the claim
+  // simply ages and gets reclaimed. Those two are different and only one is fatal.
+  const first = renew();
+  if (!first.w.ok) {
+    release();
+    return {
+      ok: false, name, chars: 0, pieces: 0, spoken: 0, results: [],
+      startedAt: new Date(startedAt).toISOString(), totalMs: Math.max(0, clock() - startedAt),
+      synthMs: 0, playMs: 0,
+      error: `could not write the claim receipt, so the envelope was put back: ${first.w.error}`,
+      receipt: null,
+    };
+  }
+  /** deliver() plus the claim bookkeeping, so the stale claim never outlives its envelope. */
+  const file = (sub_, body) => {
+    const r = deliver(sub_, body);
+    if (!r.racedBy) clearClaim();
+    return r;
+  };
+
   let env;
   try {
     env = JSON.parse(readFileSync(src, 'utf8').replace(/^\uFEFF/, ''));
   } catch (e) {
-    const receipt = deliver('.failed', { outcome: 'rejected', stage: 'envelope', error: `envelope is not valid JSON: ${e.message}` });
+    const receipt = file('.failed', { outcome: 'rejected', stage: 'envelope', error: `envelope is not valid JSON: ${e.message}` });
     return { ok: false, name, outcome: 'rejected', error: `envelope is not valid JSON: ${e.message}`, receipt };
   }
 
   const check = validateEnvelope(env);
   if (!check.ok) {
-    const receipt = deliver('.failed', { outcome: 'rejected', stage: 'envelope', error: check.problems.join('; ') });
+    const receipt = file('.failed', { outcome: 'rejected', stage: 'envelope', error: check.problems.join('; ') });
     return { ok: false, name, outcome: 'rejected', error: check.problems.join('; '), receipt };
   }
 
@@ -1014,7 +1208,7 @@ export async function flushOne(outbox, name, { userData, fetchImpl, platform, cl
   // are only how the audio is delivered, so they never become N files.
   const pieces = splitForSpeech(spoken);
   if (pieces.length === 0) {
-    const receipt = deliver('.failed', { outcome: 'rejected', stage: 'text', error: 'nothing speakable to say' });
+    const receipt = file('.failed', { outcome: 'rejected', stage: 'text', error: 'nothing speakable to say' });
     return { ok: false, name, outcome: 'rejected', error: 'nothing speakable to say', receipt };
   }
 
@@ -1039,6 +1233,10 @@ export async function flushOne(outbox, name, { userData, fetchImpl, platform, cl
     const { outcome, results } = await speakPieces(pieces, {
       synth: async (piece) => synthesize(piece, settings, fetchImpl, budgetMs),
       play,
+      // The renewal is here, BETWEEN pieces, because the window covers one piece and
+      // not a message: that is the only reason a 10-piece briefing cannot have its
+      // claim expire under a live drainer.
+      onPiece: () => renew(),
     });
 
     const totalMs = Math.max(0, clock() - startedAt);
@@ -1069,14 +1267,18 @@ export async function flushOne(outbox, name, { userData, fetchImpl, platform, cl
       // stderr with a failing exit code, which is where a delivery that did not
       // happen belongs. The summary still carries every field a receipt would.
       const error = results.find((r) => r.queued)?.error;
+      // Nothing was spoken, so the envelope goes back where the next drainer finds it,
+      // and the claim goes with it. Leaving it in `.claim/` would hide an unspoken
+      // message from every reader in this file, which is the 14:47 all over again.
+      release();
       return { ...summary, ok: false, queued: true, error, receipt: null };
     }
     if (outcome === 'failed') {
       const error = results.filter((r) => !r.ok).map((r) => `piece ${r.piece}/${r.of}: ${r.error}`).join('; ');
-      const receipt = deliver('.failed', { ...receiptBody, error });
+      const receipt = file('.failed', { ...receiptBody, error });
       return { ...summary, ok: false, error, receipt };
     }
-    const receipt = deliver('.done', receiptBody);
+    const receipt = file('.done', receiptBody);
     return { ...summary, ok: true, receipt };
   } finally {
     for (const wav of temps) { try { unlinkSync(wav); } catch { /* best effort */ } }
@@ -1226,6 +1428,19 @@ async function main(argv) {
   }
 
   if (argv.includes('--flush')) {
+    // RECOVERY FIRST, and in the same pass that speaks. This is what makes the loss
+    // impossible rather than merely guarded: a drainer that died holding a claim has its
+    // envelope put back BEFORE `pending()` reads the queue, so this very run re-speaks
+    // it. No sweeper, no second process, no timer — the next drain that happens is the
+    // one that heals it, which is the only kind of recovery that cannot itself be the
+    // thing that fails.
+    for (const c of expiredClaims(outbox)) {
+      const got = reclaim(outbox, c.name);
+      const who = c.owner ? ` (pid ${c.owner})` : "";
+      process.stderr.write(got.ok
+        ? `reclaimed ${c.name} — claim un-renewed for ${Math.round(c.waitedMs / 1000)} s, so the drainer holding it is gone; re-queuing${who}\n`
+        : `reclaim FAILED ${c.name}: ${got.error}\n`);
+    }
     const waiting = pending(outbox);
     if (!waiting.length) {
       process.stdout.write('nothing queued\n');
