@@ -299,6 +299,15 @@ export function redactSecrets(text: unknown): string {
  *  SYSTEM_SENDERS and would otherwise be counted as actionable mail forever. */
 export const UNDELIVERABLE_MARKER = '[undeliverable';
 
+/**
+ * 099: the subject of a reply whose parent is missing, and which the card's whole
+ * argument is about — the message WAS delivered, so the marker must never read as
+ * a failure. `[broken thread]`, never `[undeliverable]`: the two say opposite
+ * things about the same delivery, and a marker reused for the opposite meaning is
+ * a marker that has stopped carrying meaning.
+ */
+export const BROKEN_THREAD_MARKER = '[broken thread]';
+
 /** Levenshtein, on characters. Small inputs only — an id is a dozen characters. */
 function editDistance(a: string, b: string): number {
   if (a === b) return 0;
@@ -1708,12 +1717,119 @@ export class HiveManager {
         }
       }
     }
+    // 099: a `to` is WHERE a message lands, `in_reply_to` is WHERE IT CAME FROM.
+    // A missing address is a delivery fault and stops the message; a missing
+    // parent is a metadata fault and must NOT — the recipient is valid and the
+    // text is somebody's. So this is told, not enforced. Rejecting here would make
+    // a valid sentence die because of a field that does not change who receives
+    // it, and the error of that is not the sender's.
+    //
+    // Checked AFTER the delivery loop, so "delivered" is already a fact by the
+    // time the sender hears anything, and a refusal can never precede it.
+    if (msg.in_reply_to) this.warnBrokenThreadOnce(msg, String(msg.in_reply_to));
+
     this.appendLog({ kind: 'message', from: msg.from, to: msg.to, act: msg.act, subject: msg.subject, id: msg.id, delivered });
     this.emitMessage(msg, targets);
     // Main-process observer (e.g. the closing-time controller watching for the
     // team's ACKs and the god's COMPLETE). Best-effort, never breaks routing.
     try { this.routedObserver?.(msg, targets); } catch { /* observer error */ }
     return delivered.length > 0;
+  }
+
+  /**
+   * Does the message a reply points at still exist?
+   *
+   * Three passes, cheapest first, and it fails TOWARD SILENCE. The floor's real
+   * numbers (2026-09-29, `task-jim-099`): 646 of 1 822 messages carry an
+   * `in_reply_to`, 21 of those point at nothing (3,3 %), and 9 of those 10
+   * distinct dead ids are cited more than once — one of them four times. So the
+   * common case is "it exists" and must stay cheap, and the scan that costs
+   * something runs only once something is already wrong.
+   *
+   * A reference may or may not carry the `.json` suffix (`…-6f41ab` vs
+   * `…-broadcast.json`), so both forms are compared — otherwise half the real
+   * references would look broken and every one of them would be a false warning.
+   *
+   * **INCONCLUSIVE MEANS "EXISTS".** A bounded scan that runs out of files has
+   * not proved absence, and *a warning that is wrong teaches the reader to ignore
+   * warnings* — the same reason the near-miss stops at two edits. Guessing "broken"
+   * would trade a rare missed warning for a common false one.
+   */
+  private threadRefExists(ref: string): boolean {
+    const root = this.root();
+    if (!root) return true; // cannot look → say nothing
+    const agentsDir = join(root, 'agents');
+    let agentIds: string[] = [];
+    try { agentIds = readdirSync(agentsDir); } catch { return true; }
+    const want = ref.endsWith('.json') ? ref.slice(0, -5) : ref;
+    // 1. fast — a delivered message is filed under its own id
+    for (const a of agentIds) {
+      for (const sub of ['inbox', 'inbox/.done', 'outbox', 'outbox/.sent']) {
+        if (existsSync(join(agentsDir, a, sub, `${want}.json`))) return true;
+      }
+    }
+    // 2. the log — every routed message records its id there
+    for (const e of this.logTail(4000)) {
+      if (e && typeof e === 'object' && (e as { id?: string }).id === want) return true;
+    }
+    // 3. files written by hand are not named after their id, so a bounded read
+    let letti = 0;
+    const pila: string[] = [agentsDir];
+    while (pila.length && letti < 400) {
+      const d = pila.pop() as string;
+      let voci: ReturnType<typeof readdirSync>;
+      try { voci = readdirSync(d, { withFileTypes: true }) as never; } catch { continue; }
+      for (const v of voci as unknown as { name: string; isDirectory(): boolean }[]) {
+        const p = join(d, v.name);
+        if (v.isDirectory()) { pila.push(p); continue; }
+        if (!v.name.endsWith('.json')) continue;
+        letti++;
+        let m: { id?: string } | null = null;
+        try { m = JSON.parse(readFileSync(p, 'utf8')) as { id?: string }; } catch { continue; }
+        if (m && m.id === want) return true;
+      }
+    }
+    return letti >= 400; // scan ran out of budget → unknown → say nothing
+  }
+
+  /**
+   * Tell the sender, ONCE, that the parent they replied to is not here.
+   *
+   * Once per (sender, dead id), because the thread is broken once. Repeating it
+   * is not caution, it is a complaint: the second warning about the same missing
+   * parent carries no information the first did not, and it costs the sender an
+   * inbox line. Measured, not assumed — the dead `…-god-closing-broadcast.json`
+   * is cited by four different messages, so without the dedup that one missing
+   * broadcast would have produced four lines about a single fact.
+   *
+   * The fact lives in `log.jsonl` and only there. A second file recording the
+   * same thing would be a ledger that can contradict itself; and a dedup that
+   * forgets is the safe direction — it repeats a warning, it never invents one.
+   */
+  private warnBrokenThreadOnce(msg: HiveMessage, ref: string): void {
+    if (this.threadRefExists(ref)) return; // the parent is here: nothing to say
+    const want = ref.endsWith('.json') ? ref.slice(0, -5) : ref;
+    const giaDetto = this.logTail(4000).some(
+      (e) => e && typeof e === 'object'
+        && (e as { kind?: string }).kind === 'broken-thread'
+        && (e as { ref?: string }).ref === want
+        && (e as { from?: string }).from === msg.from
+    );
+    this.appendLog({
+      kind: 'broken-thread', from: msg.from, to: msg.to, ref: want,
+      id: msg.id, conversation: msg.conversation ?? null, told: !giaDetto
+    });
+    if (giaDetto) return; // already said, for this thread, to this sender
+    const inboxDelMittente = join(this.agentDir(msg.from), 'inbox');
+    if (!existsSync(inboxDelMittente)) return; // nowhere to tell them: the log has it
+    this.deliver({
+      ...msg,
+      from: msg.to, // whoever it was addressed to is the one reporting the break
+      act: 'inform',
+      to: msg.from,
+      hops: (msg.hops ?? 0) + 1,
+      subject: `${BROKEN_THREAD_MARKER} — your message "${msg.subject}" WAS delivered to ${msg.to}, but the message it replies to ("${want}") is not on this floor, so it will not appear as a reply to anything. The recipient has your text either way.`
+    }, msg.from);
   }
 
   /** Observer invoked for EVERY routed message with its resolved targets.
