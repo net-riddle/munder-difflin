@@ -22,8 +22,14 @@
  *  - PER_CHAR 500 ms. From 197.7 s for 464 characters measured end to end. That
  *    figure INCLUDES playback, so as a synthesis budget it errs generous — the
  *    safe direction, since waiting too long costs a pause and giving up early
- *    costs the user the sentence. It is an UPPER BOUND on synthesis, not an
- *    estimate of it: the split timing duty was never measured.
+ *    costs the user the sentence. It is still an UPPER BOUND on synthesis and not
+ *    an estimate of it — that part has not changed and is not meant to. What HAS
+ *    changed is the sentence after it: the split timing was never measured, and
+ *    now it is. Kelly, 2026-09-29, same server, real floor: 101 characters, one
+ *    piece, 16,9 s of synthesis and 8,2 s of playback, so two thirds of the wait
+ *    is the server thinking and one third is the user listening. Two thirds is the
+ *    share a length-based figure charges to the voice, which is why this number is
+ *    generous rather than tight: it is sized for the slower half of the wait.
  *  - CEILING 600 s. Past ten minutes something is wrong that waiting will not fix,
  *    and a message that takes that long to speak is its own defect.
  *
