@@ -88,13 +88,34 @@ export interface HiddenClaudeResult {
  * Exported for tests: the four branches are the whole point of this change and
  * they are unreachable without spawning a real `claude`.
  */
-export function extractLastAssistantText(
-  cwd: string, spawnedAt: number
-): { ok: true; text: string } | { ok: false; reason: HiddenClaudeFailure; detail: string } {
-  const dir = projectDir(cwd);
-  if (!existsSync(dir)) {
-    return { ok: false, reason: 'project-dir-missing', detail: dir };
+  /**
+   * Whether a hidden run's answer will be readable back at all.
+   *
+   * The directory either exists or it does not, so this is decidable in
+   * microseconds — WITHOUT spawning the process whose answer depends on it.
+   *
+   * Measured 2026-09-29: the hidden `claude` does not create a transcript for
+   * every cwd this floor uses. `condense` was therefore paying a real
+   * `claude -p` Haiku run, per agent, per tick, purely to be told the answer
+   * could not be read — 101 aborts, 0 successes, ~3 more every ten minutes.
+   *
+   * Anything about to spend minutes on an answer should ask this first. It is
+   * the same check `extractLastAssistantText` opens with, named and exported so
+   * the two cannot drift apart. */
+  export function transcriptPrecheck(cwd: string):
+    { ok: true; dir: string } | { ok: false; reason: HiddenClaudeFailure; detail: string } {
+    const dir = projectDir(cwd);
+    if (!existsSync(dir)) return { ok: false, reason: 'project-dir-missing', detail: dir };
+    return { ok: true, dir };
   }
+
+  export function extractLastAssistantText(
+    cwd: string, spawnedAt: number
+  ): { ok: true; text: string } | { ok: false; reason: HiddenClaudeFailure; detail: string } {
+    // One definition of the precondition, not two that can drift.
+    const pre = transcriptPrecheck(cwd);
+    if (!pre.ok) return pre;
+    const dir = pre.dir;
 
   const candidates: { f: string; mtime: number }[] = [];
   try {

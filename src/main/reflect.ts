@@ -25,7 +25,7 @@ import {
   mkdirSync, copyFileSync, renameSync, openSync, fsyncSync, closeSync
 } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { runHiddenClaude } from './hiddenClaude';
+import { runHiddenClaude, transcriptPrecheck } from './hiddenClaude';
 
 /** Total memory.md budget — mirrors the janitor's CONTEXT_BUDGET_BYTES (128 KB). */
 const BUDGET_BYTES = 131_072;
@@ -98,6 +98,9 @@ export class MemoryReflector {
   /** True while a reflectNow() pass is in flight — serializes the loop (a slow
    *  LLM pass must not overlap the next interval tick), mirroring MemoryManager. */
   private reflecting = false;
+  /** Last standing precondition failure reported per agent, so a condition that
+   *  persists is logged once and again only when it changes — never once a tick. */
+  private standing = new Map<string, string>();
 
   /**
    * @param getHome      Lazily resolve harnessHome so reflection follows config.
@@ -208,7 +211,35 @@ export class MemoryReflector {
       return { id, condensed: false, reason: 'backup-failed', oldBytes };
     }
 
-    // 2) SUMMARIZE the (condensed + evicted) tail via headless Haiku.
+    // 2) ASK WHETHER THE ANSWER CAN BE READ BACK — BEFORE SPENDING THE ANSWER.
+    //
+    // `summarize` runs a real `claude -p` Haiku process. Its answer is then read
+    // back out of `~/.claude/projects/<key>/`, and if that directory does not
+    // exist the whole run is thrown away — the answer was on screen and is
+    // discarded unread. So this is asked first: a missing directory is decidable
+    // with one `existsSync`, and it is NOT transient, which makes retrying it the
+    // worst form of insisting. Measured 2026-09-29: 101 `condense-abort`, 0
+    // `kind:'condense'`, ~3 aborts per 10 minutes, 1.103.841 B of memory.md that
+    // this service exists to reclaim and never has.
+    //
+    // `summarize-failed` is logged ONLY from inside `summarize`, so its absence
+    // here is the proof that no process was started.
+    const pre = transcriptPrecheck(home);
+    if (!pre.ok) {
+      // A standing condition, not an event: logged when it appears and when it
+      // changes, never once per tick. A guard that writes a line every interval
+      // is not a record, it is noise that hides the moment it starts or stops.
+      const fingerprint = `${pre.reason}: ${pre.detail}`;
+      if (this.standing.get(id) !== fingerprint) {
+        this.standing.set(id, fingerprint);
+        this.logAbort(id, 'precondition-missing', fingerprint, { cwd: home });
+      }
+      return { id, condensed: false, reason: 'precondition-missing', oldBytes };
+    }
+    // The condition cleared — forget it, or a later reappearance is never reported.
+    this.standing.delete(id);
+
+    // 3) SUMMARIZE the (condensed + evicted) tail via headless Haiku.
     let summary: { condensed: string; hoist: string[] };
     try {
       summary = await this.summarize(home, parsed.condensed, evict, parsed.pinned);
@@ -224,13 +255,13 @@ export class MemoryReflector {
       return { id, condensed: false, reason: 'summarize-failed', oldBytes };
     }
 
-    // 3) REBUILD into the 3-region shape.
+    // 4) REBUILD into the 3-region shape.
     const oldPinnedLines = pinnedLines(parsed.pinned);
     const mergedPinned = mergePinned(oldPinnedLines, summary.hoist);
     const rebuilt = rebuild(parsed.header, mergedPinned, summary.condensed, keep);
     const newBytes = Buffer.byteLength(rebuilt, 'utf8');
 
-    // 4) VERIFY-DON'T-TRUST — reject the rewrite unless every check holds.
+    // 5) VERIFY-DON'T-TRUST — reject the rewrite unless every check holds.
     const verdict = verify({
       rebuilt, newBytes, oldBytes, oldPinnedLines, mergedPinned,
       condensed: summary.condensed, keep
@@ -240,7 +271,7 @@ export class MemoryReflector {
       return { id, condensed: false, reason: verdict.reason, oldBytes, newBytes };
     }
 
-    // 5) ATOMIC SWAP — write a temp sibling, fsync, rename over the original.
+    // 6) ATOMIC SWAP — write a temp sibling, fsync, rename over the original.
     try {
       atomicWrite(mem, rebuilt);
     } catch (e) {
