@@ -891,9 +891,9 @@
     "helpListening": "聆听中——{{godName}} 正在听你说话（点击停止）",
     "helpSpeaking": "{{godName}} 正在说话（点击停止）",
     "helpWorking": "{{godName}} 正在运行工具——麦克风已静音（点击停止）",
-    "noKeyTitle": "Talk 需要你的 OpenAI API 密钥（用于 Realtime 语音 API）。可在设置 → 语音中添加。",
-    "whyDisabled": "为什么 Talk 被禁用？",
-    "popoverBody": "使用此功能需要一个 OpenAI API 密钥。",
+    "noKeyTitle": "此安装还没有声音。Talk 需要 OpenAI API 密钥（用于 Realtime 语音 API）：可在设置 → 语音中添加。如果不想用密钥，Talk 也可以配合本地 TTS 服务器工作，但必须有服务器在运行。",
+    "whyDisabled": "为什么 Talk 被禁用 — 我该怎么开启？",
+    "popoverBody": "Talk 处于关闭状态，因为此安装既没有 OpenAI API 密钥，也没有运行中的本地 TTS 服务器。两条路：在设置 → 语音中添加 OpenAI 密钥，或启动本地 TTS 服务器并在同一处选择本地语音。如果你已经做了其中之一却仍然关闭，可能应用尚未读取到。",
     "setItUpNow": "现在就去设置",
     "announcing": "播报中"
   },

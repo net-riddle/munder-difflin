@@ -495,9 +495,24 @@ const DEFAULTS: HarnessConfig = {
   freeflowModel: 'whisper-large-v3-turbo',
   realtimeVoiceEnabled: false,
   realtimeIdleDisconnectMs: 180_000,
-  // Voice backend: 'openai' until the user opts into a local TTS server in
-  // Settings → Voice, so an existing install behaves exactly as before.
-  realtimeVoiceBackend: 'openai',
+    // Voice backend. `openai` is the default so an existing install behaves exactly as
+    // before, and THAT IS THE WHOLE REASON, so here is what it costs:
+    //
+    //   `hasOpenAiKey` is `false` on any install that has no OpenAI key, and a new
+    //   install has none. So this default ships a new install with TALK GREYED OUT and
+    //   the floor unable to speak — measured 2026-09-30, 68 days after the condition
+    //   was introduced (95c9a8f0, 2026-06-23).
+    //
+    // The other backend would fix it, and as of 2026-09-30 it is NOT a fix here: the
+    // local TTS endpoint (DEFAULT_TTS_BASE_URL, realtimeVoice.ts:49) does not answer,
+    // so `local-tts` would light the button and produce silence. A lit button that
+    // does nothing is worse than a grey one that explains itself.
+    //
+    // So the default stays `openai` UNTIL there is a local voice that is actually
+    // there, and until then the UI says so — see `realtimeToggle.whyDisabled`.
+    // *A default that switches a function off on a new install, and does not say it,
+    // is a first-run defect wearing a preference's clothes.*
+    realtimeVoiceBackend: 'openai',
   realtimeTtsBaseUrl: DEFAULT_LOCAL_TTS.baseUrl,
   realtimeTtsModel: DEFAULT_LOCAL_TTS.model,
   realtimeTtsVoice: DEFAULT_LOCAL_TTS.voice,

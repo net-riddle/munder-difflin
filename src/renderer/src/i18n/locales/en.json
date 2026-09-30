@@ -891,9 +891,9 @@
     "helpListening": "Listening — {{godName}} is hearing you (click to stop)",
     "helpSpeaking": "{{godName}} is speaking (click to stop)",
     "helpWorking": "{{godName}} is running a tool — mic muted (click to stop)",
-    "noKeyTitle": "Talk needs your OpenAI API key (used for the Realtime voice API). Add it in Settings → Voice.",
-    "whyDisabled": "Why is Talk disabled?",
-    "popoverBody": "An OpenAI API key is needed to use this feature.",
+    "noKeyTitle": "This install has no voice yet. Talk needs an OpenAI API key (for the Realtime voice API) — add it in Settings → Voice. If you would rather not use a key, Talk also works with a local TTS server, but one has to be running for that to work.",
+    "whyDisabled": "Why is Talk disabled — and how do I turn it on?",
+    "popoverBody": "Talk is off because this install has neither an OpenAI API key nor a running local TTS server. Two ways out: add an OpenAI key in Settings → Voice, or start a local TTS server and choose the local voice in the same place. If you have done one of those and it is still off, the app may not have picked it up yet.",
     "setItUpNow": "set it up now",
     "announcing": "announcing"
   },

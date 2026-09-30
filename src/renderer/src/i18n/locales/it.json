@@ -861,9 +861,9 @@
     "helpListening": "In ascolto — {{godName}} ti sente (clic per fermare)",
     "helpSpeaking": "{{godName}} sta parlando (clic per fermare)",
     "helpWorking": "{{godName}} sta usando uno strumento — microfono muto (clic per fermare)",
-    "noKeyTitle": "Parla richiede la tua chiave API OpenAI (usata dall'API vocale Realtime). Aggiungila nelle Impostazioni → Voce.",
-    "whyDisabled": "Perché Parla è disattivato?",
-    "popoverBody": "Serve una chiave API OpenAI per usare questa funzionalità.",
+    "noKeyTitle": "Questa installazione non ha ancora una voce. Parla richiede la tua chiave API OpenAI (usata dall'API vocale Realtime): aggiungila nelle Impostazioni → Voce. Se preferisci non usare una chiave, Parla funziona anche con un server TTS locale, ma ne deve essere uno in esecuzione perché succeda.",
+    "whyDisabled": "Perché Parla è disattivato — e come lo attivo?",
+    "popoverBody": "Parla è spento perché questa installazione non ha né una chiave API OpenAI né un server TTS locale in esecuzione. Due strade: aggiungi una chiave OpenAI nelle Impostazioni → Voce, oppure avvia un server TTS locale e scegli la voce locale nello stesso posto. Se hai già fatto una delle due cose e resta spento, l'app potrebbe non averla ancora rilevata.",
     "setItUpNow": "configurala ora"
   },
   "updatesSection": {
